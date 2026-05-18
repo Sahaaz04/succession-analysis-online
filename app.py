@@ -8,6 +8,7 @@ from modules.northdata_to_supabase import (
     save_companies_to_master,
 )
 from modules.enrichment_to_supabase import run_combined_enrichment
+from modules.google_sheets_sync import sync_supabase_to_google_sheet
 
 
 st.set_page_config(
@@ -262,3 +263,39 @@ if "last_enrichment_result" in st.session_state:
             mime="text/csv",
             key="download_claude_models_backup",
         )
+
+st.divider()
+st.subheader("Google Sheet Sync")
+
+st.caption(
+    "This updates the fixed Google Sheet from Supabase. "
+    "It writes Overview, North Data Exports, Shareholders, News, Company Models, Processing Logs, and Cockpit."
+)
+
+if st.button("Sync Supabase to Google Sheet", type="secondary"):
+    try:
+        sync_log_box = st.empty()
+        sync_logs = []
+
+        def sync_log(message):
+            sync_logs.append(str(message))
+            sync_log_box.text("\n".join(sync_logs[-30:]))
+
+        supabase = get_supabase_client()
+
+        result = sync_supabase_to_google_sheet(
+            supabase=supabase,
+            log_callback=sync_log,
+        )
+
+        st.success("Google Sheet sync completed.")
+        st.write("Workbook:", result["spreadsheet_title"])
+        st.link_button("Open Google Sheet", result["spreadsheet_url"])
+
+        st.write("Rows synced:")
+        st.json(result["table_counts"])
+
+    except Exception as e:
+        st.error("Google Sheet sync failed.")
+        st.exception(e)
+        
