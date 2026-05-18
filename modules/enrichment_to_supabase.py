@@ -1,6 +1,7 @@
 import re
 import csv
 import time
+import hashlib
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
@@ -90,7 +91,13 @@ def now_iso():
 
 
 def safe(value):
-    return "" if value is None else str(value)
+    return "" if value is None else str(value).strip()
+
+
+def make_dedupe_key(*parts):
+    raw = "|".join(safe(part).lower() for part in parts)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
 def clean_company_name(name):
@@ -175,7 +182,7 @@ def classify_shareholder(shareholder):
 
     corporate_markers = [
         "gmbh", "ug", "ag", "kg", "ohg", "se",
-        "limited", "ltd", "sarl", "holding", "beteiligung"
+        "limited", "ltd", "sarl", "holding", "beteiligung",
     ]
 
     if any(marker in name for marker in corporate_markers):
@@ -219,23 +226,23 @@ def classify_signal_type(text, source_type):
 
     succession_terms = [
         "nachfolge", "unternehmensnachfolge", "generationenwechsel",
-        "übergabe", "familienunternehmen", "successor", "succession"
+        "übergabe", "familienunternehmen", "successor", "succession",
     ]
 
     ownership_terms = [
         "übernahme", "uebernahme", "acquisition", "acquired", "verkauft",
         "sale", "merger", "fusion", "beteiligung", "investor",
-        "gesellschafterwechsel", "shareholder change"
+        "gesellschafterwechsel", "shareholder change",
     ]
 
     distress_terms = [
         "insolvenz", "insolvency", "bankruptcy", "restrukturierung",
-        "restructuring", "sanierung", "liquidation", "auflösung"
+        "restructuring", "sanierung", "liquidation", "auflösung",
     ]
 
     management_terms = [
         "geschäftsführerwechsel", "new managing director",
-        "management change", "ceo", "appointed", "geschäftsführung"
+        "management change", "ceo", "appointed", "geschäftsführung",
     ]
 
     if any(term in text_lower for term in succession_terms):
@@ -623,11 +630,12 @@ def build_shareholder_rows(company, data, api_status, notes):
             shareholder_country_code = shareholder.get("country_code") or ""
             shareholder_registration_reference = shareholder.get("registration_reference") or ""
 
-        dedupe_key = (
+        dedupe_key = make_dedupe_key(
             register_id,
             shareholder_name,
-            safe(contribution_amount),
-            safe(ownership_ratio),
+            contribution_amount,
+            ownership_percent,
+            ownership_ratio,
         )
 
         if dedupe_key in seen:
@@ -661,6 +669,7 @@ def build_shareholder_rows(company, data, api_status, notes):
             "notes": notes or "",
             "retrieved_at": now_iso(),
             "raw_data": entry,
+            "dedupe_key": dedupe_key,
             "_source_row": source_row,
         })
 
@@ -682,12 +691,17 @@ def build_news_rows(company, data, api_status, notes):
     seen = set()
 
     for item in all_items:
-        dedupe_key = (
+        title = safe(item.get("title"))
+        url = safe(item.get("url"))
+        date = safe(item.get("date"))
+        source_type = safe(item.get("source_type"))
+
+        dedupe_key = make_dedupe_key(
             register_id,
-            item.get("source_type", ""),
-            item.get("date", ""),
-            item.get("title", ""),
-            item.get("url", ""),
+            source_type,
+            date,
+            title,
+            url,
         )
 
         if dedupe_key in seen:
@@ -698,21 +712,22 @@ def build_news_rows(company, data, api_status, notes):
         rows.append({
             "company_register_id": register_id,
             "company_name": company_name,
-            "source_type": safe(item.get("source_type")),
+            "source_type": source_type,
             "signal_type": safe(item.get("signal_type")),
             "announcement_header": safe(item.get("announcement_header")),
-            "date": safe(item.get("date")),
-            "title": safe(item.get("title")),
+            "date": date,
+            "title": title,
             "summary_context": safe(item.get("summary_context")),
             "court": safe(item.get("court")),
             "case_number": safe(item.get("case_number")),
             "register_reference": safe(item.get("register_reference")),
-            "url": safe(item.get("url")),
+            "url": url,
             "source_name": safe(item.get("source_name")),
             "api_status": str(api_status),
             "notes": notes or "",
             "retrieved_at": now_iso(),
             "raw_data": item.get("raw_data", item),
+            "dedupe_key": dedupe_key,
             "_source_row": source_row,
         })
 
@@ -758,7 +773,7 @@ def extract_text_from_html(html):
 
     for tag in soup([
         "script", "style", "noscript", "svg",
-        "nav", "footer", "header", "form"
+        "nav", "footer", "header", "form",
     ]):
         tag.decompose()
 
@@ -954,7 +969,23 @@ def insert_rows(supabase, table_name, rows, chunk_size=100):
 
     for i in range(0, len(cleaned_rows), chunk_size):
         chunk = cleaned_rows[i:i + chunk_size]
-        supabase.table(table_name).insert(chunk).execute()
+
+        if table_name in ["shareholders", "company_news"]:
+            supabase.table(table_name).upsert(
+                chunk,
+                on_conflict="company_register_id,dedupe_key",
+            ).execute()
+        else:
+            supabase.table(table_name).insert(chunk).execute()
+
+
+def upsert_company_model(supabase, model_row):
+    cleaned = strip_internal_fields(model_row)
+
+    supabase.table("company_models").upsert(
+        cleaned,
+        on_conflict="company_register_id,model_provider,model_name",
+    ).execute()
 
 
 def log_to_supabase(supabase, register_id, company_name, module, status, message):
@@ -1175,10 +1206,7 @@ def run_combined_enrichment(
                     "_source_row": source_row,
                 }
 
-                supabase.table("company_models").insert(
-                    strip_internal_fields(model_row)
-                ).execute()
-
+                upsert_company_model(supabase, model_row)
                 all_model_rows.append(model_row)
 
                 log_to_supabase(
