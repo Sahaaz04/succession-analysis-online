@@ -5,3 +5,5 @@ requests
 beautifulsoup4
 anthropic
 supabase
+gspread
+google-auth
