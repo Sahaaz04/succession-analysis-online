@@ -897,17 +897,23 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
     prompt = build_claude_prompt(company_name, url, website_text)
 
     try:
-        response = client.messages.create(
-            model=model_name,
-            max_tokens=250,
-            temperature=0.2,
-            messages=[
+        request_payload = {
+            "model": model_name,
+            "max_tokens": 250,
+            "messages": [
                 {
                     "role": "user",
                     "content": prompt,
                 }
             ],
-        )
+        }
+
+        # Opus 4.7 rejects temperature.
+        # Sonnet/older models can still use it.
+        if "opus-4-7" not in str(model_name).lower():
+            request_payload["temperature"] = 0.2
+
+        response = client.messages.create(**request_payload)
 
         text_parts = []
 
