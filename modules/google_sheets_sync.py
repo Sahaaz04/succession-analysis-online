@@ -1,4 +1,3 @@
-import json
 from datetime import datetime, timezone
 
 import gspread
@@ -52,12 +51,7 @@ SHEET_CONFIG = [
 
 
 def get_google_client():
-    service_account_raw = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
-
-    if isinstance(service_account_raw, str):
-        service_account_info = json.loads(service_account_raw)
-    else:
-        service_account_info = dict(service_account_raw)
+    service_account_info = dict(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
 
     credentials = Credentials.from_service_account_info(
         service_account_info,
@@ -112,7 +106,7 @@ def clean_cell_value(value):
         return ""
 
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
+        return str(value)
 
     return str(value)
 
@@ -132,8 +126,8 @@ def rows_to_sheet_values(rows, exclude_columns=None):
     df = df.fillna("")
 
     headers = list(df.columns)
-    values = []
 
+    values = []
     for _, row in df.iterrows():
         values.append([clean_cell_value(row[col]) for col in headers])
 
@@ -150,6 +144,7 @@ def write_values_to_worksheet(worksheet, values):
     col_count = max(len(values[0]) + 5, 20)
 
     worksheet.resize(rows=row_count, cols=col_count)
+
     worksheet.update(
         values=values,
         range_name="A1",
