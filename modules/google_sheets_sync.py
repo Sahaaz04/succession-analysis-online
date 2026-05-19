@@ -12,16 +12,7 @@ SCOPES = [
 ]
 
 
-SHEET_CONFIG = [
-    {
-        "sheet_name": "Cockpit",
-        "source": "cockpit",
-    },
-    {
-        "sheet_name": "Overview",
-        "source": "master_overview",
-        "exclude_columns": [],
-    },
+RAW_SHEETS = [
     {
         "sheet_name": "North Data Exports",
         "source": "companies",
@@ -47,6 +38,130 @@ SHEET_CONFIG = [
         "source": "processing_logs",
         "exclude_columns": ["id"],
     },
+]
+
+
+HEADER_RENAMES = {
+    "register_id": "Register ID",
+    "company_register_id": "Register ID",
+    "name": "Company Name",
+    "company_name": "Company Name",
+    "legal_form": "Legal Form",
+    "country": "Country",
+    "postal_code": "Postal Code",
+    "city": "City",
+    "street": "Street",
+    "register_court": "Register Court",
+    "status": "Status",
+    "north_data_url": "North Data URL",
+    "phone": "Phone",
+    "fax": "Fax",
+    "email": "Email",
+    "website": "Website",
+    "vat_id": "VAT ID",
+    "industry_segment": "Industry Segment",
+    "wz_code": "WZ Code",
+    "business_segment": "Business Segment",
+    "subject": "Business Model",
+    "detailed_business_model": "Detailed Business Model",
+    "summary": "Detailed Business Model",
+    "financials_date": "Financial Data Year",
+    "base_share_capital_eur": "Base Share Capital EUR",
+    "total_assets_eur": "Total Assets EUR",
+    "earnings_eur": "Net Income EUR",
+    "net_income_eur": "Net Income EUR",
+    "earnings_cagr_percent": "Earnings CAGR %",
+    "revenue_eur": "Revenue EUR",
+    "revenue_cagr_percent": "Revenue CAGR %",
+    "return_on_sales_percent": "Return on Sales %",
+    "equity_eur": "Equity EUR",
+    "equity_ratio_percent": "Equity Ratio %",
+    "return_on_equity_percent": "Return on Equity %",
+    "employee_number": "Number of Employees",
+    "revenue_per_employee_eur": "Revenue per Employee EUR",
+    "taxes_eur": "Taxes EUR",
+    "tax_ratio_percent": "Tax Ratio %",
+    "cash_on_hand_eur": "Cash on Hand EUR",
+    "receivables_eur": "Receivables EUR",
+    "liabilities_eur": "Liabilities EUR",
+    "cost_of_materials_eur": "Cost of Materials EUR",
+    "wages_and_salaries_eur": "Wages and Salaries EUR",
+    "average_salaries_per_employee_eur": "Average Salaries per Employee EUR",
+    "pension_provisions_eur": "Pension Provisions EUR",
+    "real_estate_eur": "Real Estate EUR",
+    "shareholder_name": "Shareholder Name",
+    "shareholder_type": "Shareholder Type",
+    "birth_dob": "Birth/DOB",
+    "age": "Shareholder Age",
+    "shareholder_address": "Shareholder Address",
+    "shareholder_country_code": "Shareholder Country Code",
+    "shareholder_registration_reference": "Shareholder Registration Reference",
+    "contribution_amount": "Shareholder Contribution",
+    "contribution_currency": "Contribution Currency",
+    "ownership_ratio": "Ownership Ratio",
+    "ownership_percent": "Shareholder Ownership %",
+    "matched_entity_id": "Matched Entity ID",
+    "matched_company_name": "Matched Company Name",
+    "matched_status": "Matched Status",
+    "register_type": "Register Type",
+    "register_number": "Register Number",
+    "register_match": "Register Match",
+    "source_type": "Source Type",
+    "signal_type": "News Type",
+    "announcement_header": "Announcement Header",
+    "date": "News Date",
+    "title": "News Title",
+    "summary_context": "News Summary",
+    "court": "Court",
+    "case_number": "Case Number",
+    "register_reference": "Register Reference",
+    "url": "News URL",
+    "source_name": "Source Name",
+    "model_provider": "Model Provider",
+    "model_name": "Model Name",
+    "api_status": "API Status",
+    "notes": "Notes",
+    "created_at": "Created At",
+    "updated_at": "Updated At",
+    "retrieved_at": "Retrieved At",
+    "company_updated_at": "Company Updated At",
+    "model_updated_at": "Model Updated At",
+    "last_updated_at": "Last Updated At",
+    "module": "Module",
+    "message": "Message",
+}
+
+
+OVERVIEW_HEADERS = [
+    "Register ID",
+    "Company Name",
+    "Legal Form",
+    "WZ Code",
+    "Business Segment",
+    "Business Model",
+    "Detailed Business Model",
+    "City",
+    "Revenue EUR",
+    "Net Income EUR",
+    "Total Assets EUR",
+    "Equity EUR",
+    "Equity Ratio %",
+    "Financial Data Year",
+    "Number of Employees",
+    "Number of Shareholders",
+    "Shareholder Name",
+    "Shareholder Age",
+    "Shareholder Type",
+    "Shareholder Contribution",
+    "Shareholder Ownership %",
+    "News Title",
+    "News Date",
+    "News Type",
+    "News URL",
+    "Website",
+    "Company Updated At",
+    "Model Updated At",
+    "Last Updated At",
 ]
 
 
@@ -111,6 +226,13 @@ def clean_cell_value(value):
     return str(value)
 
 
+def nice_header(column_name):
+    return HEADER_RENAMES.get(
+        column_name,
+        str(column_name).replace("_", " ").title(),
+    )
+
+
 def rows_to_sheet_values(rows, exclude_columns=None):
     exclude_columns = set(exclude_columns or [])
 
@@ -125,13 +247,216 @@ def rows_to_sheet_values(rows, exclude_columns=None):
 
     df = df.fillna("")
 
-    headers = list(df.columns)
+    headers = [nice_header(col) for col in df.columns]
 
     values = []
     for _, row in df.iterrows():
-        values.append([clean_cell_value(row[col]) for col in headers])
+        values.append([clean_cell_value(row[col]) for col in df.columns])
 
     return [headers] + values
+
+
+def index_by_register_id(rows, key="company_register_id"):
+    result = {}
+
+    for row in rows:
+        register_id = row.get(key) or row.get("register_id")
+        if not register_id:
+            continue
+
+        result.setdefault(str(register_id).strip(), []).append(row)
+
+    return result
+
+
+def get_latest_model_for_register(company_models, register_id):
+    matches = [
+        row for row in company_models
+        if str(row.get("company_register_id", "")).strip() == register_id
+        and row.get("model_provider") == "claude"
+    ]
+
+    if not matches:
+        return None
+
+    return sorted(
+        matches,
+        key=lambda x: str(x.get("created_at", "")),
+        reverse=True,
+    )[0]
+
+
+def get_default_shareholder(shareholders_by_register, register_id):
+    rows = shareholders_by_register.get(register_id, [])
+
+    rows = [
+        row for row in rows
+        if str(row.get("shareholder_name", "")).strip()
+    ]
+
+    if not rows:
+        return {}
+
+    return sorted(
+        rows,
+        key=lambda x: str(x.get("retrieved_at", "")),
+        reverse=True,
+    )[0]
+
+
+def get_default_news(news_by_register, register_id):
+    rows = news_by_register.get(register_id, [])
+
+    rows = [
+        row for row in rows
+        if str(row.get("title", "")).strip()
+    ]
+
+    if not rows:
+        return {}
+
+    return sorted(
+        rows,
+        key=lambda x: (
+            str(x.get("date", "")),
+            str(x.get("retrieved_at", "")),
+        ),
+        reverse=True,
+    )[0]
+
+
+def build_shareholder_count_text(shareholders_by_register, register_id):
+    rows = shareholders_by_register.get(register_id, [])
+
+    rows = [
+        row for row in rows
+        if str(row.get("shareholder_name", "")).strip()
+    ]
+
+    total = len(rows)
+
+    if total == 0:
+        return ""
+
+    natural = 0
+    corporate = 0
+
+    for row in rows:
+        sh_type = str(row.get("shareholder_type", "")).lower()
+
+        if "natural" in sh_type:
+            natural += 1
+        elif "corporate" in sh_type:
+            corporate += 1
+
+    return f"{total} ({natural} Natural + {corporate} Corporate)"
+
+
+def build_overview_values(companies, shareholders, company_news, company_models):
+    shareholders_by_register = index_by_register_id(shareholders)
+    news_by_register = index_by_register_id(company_news)
+
+    sorted_companies = sorted(
+        companies,
+        key=lambda x: (
+            str(x.get("name", "")).lower(),
+            str(x.get("register_id", "")),
+        ),
+    )
+
+    values = [OVERVIEW_HEADERS]
+
+    for company in sorted_companies:
+        register_id = str(company.get("register_id", "")).strip()
+
+        if not register_id:
+            continue
+
+        model = get_latest_model_for_register(company_models, register_id) or {}
+        shareholder = get_default_shareholder(shareholders_by_register, register_id)
+        news = get_default_news(news_by_register, register_id)
+
+        next_row_number = len(values) + 1
+
+        # Overview column positions:
+        # K = Total Assets EUR, L = Equity EUR, M = Equity Ratio %
+        equity_ratio_formula = f'=IFERROR(L{next_row_number}/K{next_row_number},"")'
+
+        row = [
+            register_id,
+            company.get("name", ""),
+            company.get("legal_form", ""),
+            company.get("wz_code", ""),
+            company.get("business_segment", ""),
+            company.get("subject", ""),
+            model.get("summary", ""),
+            company.get("city", ""),
+            company.get("revenue_eur", ""),
+            company.get("earnings_eur", ""),
+            company.get("total_assets_eur", ""),
+            company.get("equity_eur", ""),
+            equity_ratio_formula,
+            company.get("financials_date", ""),
+            company.get("employee_number", ""),
+            build_shareholder_count_text(shareholders_by_register, register_id),
+            shareholder.get("shareholder_name", ""),
+            shareholder.get("age", ""),
+            shareholder.get("shareholder_type", ""),
+            shareholder.get("contribution_amount", ""),
+            shareholder.get("ownership_percent", ""),
+            news.get("title", ""),
+            news.get("date", ""),
+            news.get("signal_type", ""),
+            news.get("url", ""),
+            company.get("website", ""),
+            company.get("updated_at", ""),
+            model.get("created_at", ""),
+            max(
+                str(company.get("updated_at", "")),
+                str(model.get("created_at", "")),
+            ),
+        ]
+
+        values.append([clean_cell_value(value) for value in row])
+
+    return values
+
+
+def build_cockpit_values():
+    return [
+        ["Succession Analysis Cockpit"],
+        [""],
+        ["Select / Enter Register ID", ""],
+        [""],
+        ["Field", "Value"],
+        ["Company Name", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$B:$B),"")'],
+        ["Legal Form", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$C:$C),"")'],
+        ["WZ Code", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$D:$D),"")'],
+        ["Business Segment", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$E:$E),"")'],
+        ["Business Model", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$F:$F),"")'],
+        ["Detailed Business Model", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$G:$G),"")'],
+        ["City", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$H:$H),"")'],
+        ["Revenue EUR", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$I:$I),"")'],
+        ["Net Income EUR", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$J:$J),"")'],
+        ["Total Assets EUR", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$K:$K),"")'],
+        ["Equity EUR", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$L:$L),"")'],
+        ["Equity Ratio %", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$M:$M),"")'],
+        ["Financial Data Year", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$N:$N),"")'],
+        ["Number of Employees", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$O:$O),"")'],
+        ["Number of Shareholders", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$P:$P),"")'],
+        ["Shareholder Name", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Q:$Q),"")'],
+        ["Shareholder Age", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$R:$R),"")'],
+        ["Shareholder Type", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$S:$S),"")'],
+        ["Shareholder Contribution", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$T:$T),"")'],
+        ["Shareholder Ownership %", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$U:$U),"")'],
+        ["News Title", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$V:$V),"")'],
+        ["News Date", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$W:$W),"")'],
+        ["News Type", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$X:$X),"")'],
+        ["News URL", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Y:$Y),"")'],
+        ["Website", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Z:$Z),"")'],
+        [""],
+        ["Note", "Dropdowns for Register ID, Shareholder, and News will be handled by Apps Script."],
+    ]
 
 
 def write_values_to_worksheet(worksheet, values):
@@ -156,41 +481,85 @@ def write_values_to_worksheet(worksheet, values):
     except Exception:
         pass
 
+
+def format_worksheet_basic(worksheet):
     try:
         worksheet.format(
             "1:1",
             {
                 "textFormat": {"bold": True},
                 "horizontalAlignment": "CENTER",
+                "backgroundColor": {
+                    "red": 0.85,
+                    "green": 0.90,
+                    "blue": 1.0,
+                },
+            },
+        )
+    except Exception:
+        pass
+
+    try:
+        worksheet.format(
+            "A:Z",
+            {
+                "wrapStrategy": "WRAP",
+                "verticalAlignment": "MIDDLE",
             },
         )
     except Exception:
         pass
 
 
-def build_cockpit_values(table_counts):
-    now_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def format_overview_sheet(worksheet):
+    format_worksheet_basic(worksheet)
 
-    values = [
-        ["Succession Analysis Master Workbook"],
-        [""],
-        ["Last synced", now_text],
-        [""],
-        ["Table", "Rows"],
-    ]
+    try:
+        worksheet.format(
+            "M:M",
+            {
+                "numberFormat": {
+                    "type": "PERCENT",
+                    "pattern": "0.0%",
+                },
+            },
+        )
+    except Exception:
+        pass
 
-    for table_name, count in table_counts.items():
-        values.append([table_name, count])
 
-    values.extend([
-        [""],
-        ["Notes"],
-        ["This workbook is synced from Supabase by Register ID."],
-        ["Companies are stored once in the master database."],
-        ["Shareholders, news, and model summaries are linked by Register ID."],
-    ])
-
-    return values
+def format_cockpit_sheet(worksheet):
+    try:
+        worksheet.format(
+            "A1:B1",
+            {
+                "textFormat": {"bold": True, "fontSize": 14},
+                "backgroundColor": {
+                    "red": 0.85,
+                    "green": 0.90,
+                    "blue": 1.0,
+                },
+            },
+        )
+        worksheet.format(
+            "A5:B5",
+            {
+                "textFormat": {"bold": True},
+                "backgroundColor": {
+                    "red": 0.90,
+                    "green": 0.90,
+                    "blue": 0.90,
+                },
+            },
+        )
+        worksheet.format(
+            "A:A",
+            {
+                "textFormat": {"bold": True},
+            },
+        )
+    except Exception:
+        pass
 
 
 def sync_supabase_to_google_sheet(supabase, log_callback=None):
@@ -199,22 +568,61 @@ def sync_supabase_to_google_sheet(supabase, log_callback=None):
     google_client = get_google_client()
     spreadsheet = google_client.open_by_key(sheet_id)
 
-    table_counts = {}
+    if log_callback:
+        log_callback("Fetching Supabase data...")
 
-    for config in SHEET_CONFIG:
+    companies = fetch_all_rows(supabase, "companies")
+    shareholders = fetch_all_rows(supabase, "shareholders")
+    company_news = fetch_all_rows(supabase, "company_news")
+    company_models = fetch_all_rows(supabase, "company_models")
+    processing_logs = fetch_all_rows(supabase, "processing_logs")
+
+    table_counts = {
+        "Overview": len(companies),
+        "North Data Exports": len(companies),
+        "Shareholders": len(shareholders),
+        "News": len(company_news),
+        "Company Models": len(company_models),
+        "Processing Logs": len(processing_logs),
+    }
+
+    if log_callback:
+        log_callback("Writing Overview...")
+
+    overview_sheet = get_or_create_worksheet(spreadsheet, "Overview")
+    overview_values = build_overview_values(
+        companies=companies,
+        shareholders=shareholders,
+        company_news=company_news,
+        company_models=company_models,
+    )
+    write_values_to_worksheet(overview_sheet, overview_values)
+    format_overview_sheet(overview_sheet)
+
+    if log_callback:
+        log_callback("Writing Cockpit...")
+
+    cockpit_sheet = get_or_create_worksheet(spreadsheet, "Cockpit")
+    cockpit_values = build_cockpit_values()
+    write_values_to_worksheet(cockpit_sheet, cockpit_values)
+    format_cockpit_sheet(cockpit_sheet)
+
+    raw_data_map = {
+        "North Data Exports": companies,
+        "Shareholders": shareholders,
+        "News": company_news,
+        "Company Models": company_models,
+        "Processing Logs": processing_logs,
+    }
+
+    for config in RAW_SHEETS:
         sheet_name = config["sheet_name"]
-        source = config["source"]
 
         if log_callback:
-            log_callback(f"Syncing sheet: {sheet_name}")
+            log_callback(f"Writing {sheet_name}...")
 
         worksheet = get_or_create_worksheet(spreadsheet, sheet_name)
-
-        if source == "cockpit":
-            continue
-
-        rows = fetch_all_rows(supabase, source)
-        table_counts[source] = len(rows)
+        rows = raw_data_map.get(sheet_name, [])
 
         values = rows_to_sheet_values(
             rows,
@@ -222,10 +630,7 @@ def sync_supabase_to_google_sheet(supabase, log_callback=None):
         )
 
         write_values_to_worksheet(worksheet, values)
-
-    cockpit_sheet = get_or_create_worksheet(spreadsheet, "Cockpit")
-    cockpit_values = build_cockpit_values(table_counts)
-    write_values_to_worksheet(cockpit_sheet, cockpit_values)
+        format_worksheet_basic(worksheet)
 
     return {
         "spreadsheet_title": spreadsheet.title,
