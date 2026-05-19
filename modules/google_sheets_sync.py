@@ -16,27 +16,38 @@ RAW_SHEETS = [
     {
         "sheet_name": "North Data Exports",
         "source": "companies",
-        "exclude_columns": ["id", "raw_data"],
+        "exclude_columns": ["id", "raw_data", "input_row", "source_row"],
     },
     {
         "sheet_name": "Shareholders",
         "source": "shareholders",
-        "exclude_columns": ["id", "raw_data", "dedupe_key"],
+        "exclude_columns": ["id", "raw_data", "dedupe_key", "input_row", "source_row"],
     },
     {
         "sheet_name": "News",
         "source": "company_news",
-        "exclude_columns": ["id", "raw_data", "dedupe_key"],
+        "exclude_columns": [
+            "id",
+            "raw_data",
+            "dedupe_key",
+            "input_row",
+            "source_row",
+            "summary_context",
+            "court",
+            "case_number",
+            "register_reference",
+            "notes",
+        ],
     },
     {
         "sheet_name": "Company Models",
         "source": "company_models",
-        "exclude_columns": ["id", "raw_data"],
+        "exclude_columns": ["id", "raw_data", "input_row", "source_row"],
     },
     {
         "sheet_name": "Processing Logs",
         "source": "processing_logs",
-        "exclude_columns": ["id"],
+        "exclude_columns": ["id", "input_row", "source_row"],
     },
 ]
 
@@ -216,14 +227,21 @@ def fetch_all_rows(supabase, table_name, chunk_size=1000):
     return all_rows
 
 
-def clean_cell_value(value):
+def clean_cell_value(value, allow_formulas=False):
     if value is None:
         return ""
 
     if isinstance(value, (dict, list)):
-        return str(value)
+        value = str(value)
+    else:
+        value = str(value)
 
-    return str(value)
+    value = value.strip()
+
+    if not allow_formulas and value.startswith(("=", "+", "-", "@")):
+        return "'" + value
+
+    return value
 
 
 def nice_header(column_name):
@@ -251,7 +269,10 @@ def rows_to_sheet_values(rows, exclude_columns=None):
 
     values = []
     for _, row in df.iterrows():
-        values.append([clean_cell_value(row[col]) for col in df.columns])
+        values.append([
+            clean_cell_value(row[col], allow_formulas=False)
+            for col in df.columns
+        ])
 
     return [headers] + values
 
@@ -417,7 +438,7 @@ def build_overview_values(companies, shareholders, company_news, company_models)
             ),
         ]
 
-        values.append([clean_cell_value(value) for value in row])
+        values.append([clean_cell_value(value, allow_formulas=True) for value in row])
 
     return values
 
@@ -455,7 +476,7 @@ def build_cockpit_values():
         ["News URL", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Y:$Y),"")'],
         ["Website", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Z:$Z),"")'],
         [""],
-        ["Note", "Dropdowns for Register ID, Shareholder, and News will be handled by Apps Script."],
+        
     ]
 
 
