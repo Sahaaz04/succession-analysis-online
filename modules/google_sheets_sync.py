@@ -45,6 +45,11 @@ RAW_SHEETS = [
         "exclude_columns": ["id", "raw_data", "input_row", "source_row"],
     },
     {
+        "sheet_name": "Fit Scores",
+        "source": "company_fit_scores",
+        "exclude_columns": ["id", "raw_data", "input_row", "source_row"],
+    },
+    {
         "sheet_name": "Processing Logs",
         "source": "processing_logs",
         "exclude_columns": ["id", "input_row", "source_row"],
@@ -122,10 +127,6 @@ HEADER_RENAMES = {
     "announcement_header": "Announcement Header",
     "date": "News Date",
     "title": "News Title",
-    "summary_context": "News Summary",
-    "court": "Court",
-    "case_number": "Case Number",
-    "register_reference": "Register Reference",
     "url": "News URL",
     "source_name": "Source Name",
     "model_provider": "Model Provider",
@@ -140,6 +141,14 @@ HEADER_RENAMES = {
     "last_updated_at": "Last Updated At",
     "module": "Module",
     "message": "Message",
+    "fit_score": "Fit Score",
+    "fit_label": "Fit Label",
+    "fit_comment": "Fit Comment",
+    "succession_signal": "Succession Signal",
+    "financial_signal": "Financial Signal",
+    "shareholder_signal": "Shareholder Signal",
+    "risk_flags": "Risk Flags",
+    "recommended_action": "Recommended Action",
 }
 
 
@@ -170,6 +179,16 @@ OVERVIEW_HEADERS = [
     "News Type",
     "News URL",
     "Website",
+    "Fit Score",
+    "Fit Label",
+    "Fit Comment",
+    "Succession Signal",
+    "Financial Signal",
+    "Shareholder Signal",
+    "Risk Flags",
+    "Recommended Action",
+    "Scoring Model",
+    "Score Updated At",
     "Company Updated At",
     "Model Updated At",
     "Last Updated At",
@@ -298,11 +317,28 @@ def get_latest_model_for_register(company_models, register_id):
     ]
 
     if not matches:
-        return None
+        return {}
 
     return sorted(
         matches,
         key=lambda x: str(x.get("created_at", "")),
+        reverse=True,
+    )[0]
+
+
+def get_latest_fit_score_for_register(fit_scores, register_id):
+    matches = [
+        row for row in fit_scores
+        if str(row.get("company_register_id", "")).strip() == register_id
+        and row.get("model_provider") == "claude"
+    ]
+
+    if not matches:
+        return {}
+
+    return sorted(
+        matches,
+        key=lambda x: str(x.get("updated_at", "") or x.get("created_at", "")),
         reverse=True,
     )[0]
 
@@ -373,7 +409,13 @@ def build_shareholder_count_text(shareholders_by_register, register_id):
     return f"{total} ({natural} Natural + {corporate} Corporate)"
 
 
-def build_overview_values(companies, shareholders, company_news, company_models):
+def build_overview_values(
+    companies,
+    shareholders,
+    company_news,
+    company_models,
+    fit_scores,
+):
     shareholders_by_register = index_by_register_id(shareholders)
     news_by_register = index_by_register_id(company_news)
 
@@ -393,7 +435,8 @@ def build_overview_values(companies, shareholders, company_news, company_models)
         if not register_id:
             continue
 
-        model = get_latest_model_for_register(company_models, register_id) or {}
+        model = get_latest_model_for_register(company_models, register_id)
+        fit_score = get_latest_fit_score_for_register(fit_scores, register_id)
         shareholder = get_default_shareholder(shareholders_by_register, register_id)
         news = get_default_news(news_by_register, register_id)
 
@@ -402,6 +445,12 @@ def build_overview_values(companies, shareholders, company_news, company_models)
         # Overview column positions:
         # K = Total Assets EUR, L = Equity EUR, M = Equity Ratio %
         equity_ratio_formula = f'=IFERROR(L{next_row_number}/K{next_row_number},"")'
+
+        company_updated_at = str(company.get("updated_at", ""))
+        model_updated_at = str(model.get("created_at", ""))
+        score_updated_at = str(fit_score.get("updated_at", "") or fit_score.get("created_at", ""))
+
+        last_updated_at = max(company_updated_at, model_updated_at, score_updated_at)
 
         row = [
             register_id,
@@ -430,12 +479,19 @@ def build_overview_values(companies, shareholders, company_news, company_models)
             news.get("signal_type", ""),
             news.get("url", ""),
             company.get("website", ""),
-            company.get("updated_at", ""),
-            model.get("created_at", ""),
-            max(
-                str(company.get("updated_at", "")),
-                str(model.get("created_at", "")),
-            ),
+            fit_score.get("fit_score", ""),
+            fit_score.get("fit_label", ""),
+            fit_score.get("fit_comment", ""),
+            fit_score.get("succession_signal", ""),
+            fit_score.get("financial_signal", ""),
+            fit_score.get("shareholder_signal", ""),
+            fit_score.get("risk_flags", ""),
+            fit_score.get("recommended_action", ""),
+            fit_score.get("model_name", ""),
+            score_updated_at,
+            company_updated_at,
+            model_updated_at,
+            last_updated_at,
         ]
 
         values.append([clean_cell_value(value, allow_formulas=True) for value in row])
@@ -475,8 +531,14 @@ def build_cockpit_values():
         ["News Type", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$X:$X),"")'],
         ["News URL", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Y:$Y),"")'],
         ["Website", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Z:$Z),"")'],
-        [""],
-        
+        ["Fit Score", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AA:$AA),"")'],
+        ["Fit Label", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AB:$AB),"")'],
+        ["Fit Comment", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AC:$AC),"")'],
+        ["Succession Signal", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AD:$AD),"")'],
+        ["Financial Signal", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AE:$AE),"")'],
+        ["Shareholder Signal", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AF:$AF),"")'],
+        ["Risk Flags", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AG:$AG),"")'],
+        ["Recommended Action", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AH:$AH),"")'],
     ]
 
 
@@ -522,7 +584,7 @@ def format_worksheet_basic(worksheet):
 
     try:
         worksheet.format(
-            "A:Z",
+            "A:AZ",
             {
                 "wrapStrategy": "WRAP",
                 "verticalAlignment": "MIDDLE",
@@ -579,6 +641,13 @@ def format_cockpit_sheet(worksheet):
                 "textFormat": {"bold": True},
             },
         )
+        worksheet.format(
+            "A:B",
+            {
+                "wrapStrategy": "WRAP",
+                "verticalAlignment": "MIDDLE",
+            },
+        )
     except Exception:
         pass
 
@@ -596,6 +665,7 @@ def sync_supabase_to_google_sheet(supabase, log_callback=None):
     shareholders = fetch_all_rows(supabase, "shareholders")
     company_news = fetch_all_rows(supabase, "company_news")
     company_models = fetch_all_rows(supabase, "company_models")
+    fit_scores = fetch_all_rows(supabase, "company_fit_scores")
     processing_logs = fetch_all_rows(supabase, "processing_logs")
 
     table_counts = {
@@ -604,6 +674,7 @@ def sync_supabase_to_google_sheet(supabase, log_callback=None):
         "Shareholders": len(shareholders),
         "News": len(company_news),
         "Company Models": len(company_models),
+        "Fit Scores": len(fit_scores),
         "Processing Logs": len(processing_logs),
     }
 
@@ -616,6 +687,7 @@ def sync_supabase_to_google_sheet(supabase, log_callback=None):
         shareholders=shareholders,
         company_news=company_news,
         company_models=company_models,
+        fit_scores=fit_scores,
     )
     write_values_to_worksheet(overview_sheet, overview_values)
     format_overview_sheet(overview_sheet)
@@ -633,6 +705,7 @@ def sync_supabase_to_google_sheet(supabase, log_callback=None):
         "Shareholders": shareholders,
         "News": company_news,
         "Company Models": company_models,
+        "Fit Scores": fit_scores,
         "Processing Logs": processing_logs,
     }
 
