@@ -8,6 +8,7 @@ from modules.northdata_to_supabase import (
     save_companies_to_master,
 )
 from modules.enrichment_to_supabase import run_combined_enrichment
+from modules.fit_scoring import run_fit_scoring
 from modules.google_sheets_sync import sync_supabase_to_google_sheet
 
 
@@ -81,7 +82,7 @@ with st.expander("Run settings", expanded=True):
     )
 
     enrichment_behavior = st.radio(
-        "If enrichment already exists for a Register ID",
+        "If enrichment / scoring already exists for a Register ID",
         options=[
             "Skip existing enrichment",
             "Replace existing enrichment",
@@ -89,7 +90,7 @@ with st.expander("Run settings", expanded=True):
         index=0,
     )
 
-    col7, col8 = st.columns(2)
+    col7, col8, col9 = st.columns(3)
 
     with col7:
         run_hr = st.checkbox(
@@ -103,29 +104,41 @@ with st.expander("Run settings", expanded=True):
             value=True,
         )
 
-with st.expander("API keys", expanded=True):
-    col9, col10 = st.columns(2)
-
     with col9:
+        run_fit_score = st.checkbox(
+            "Run Claude fit scoring",
+            value=False,
+        )
+
+with st.expander("API keys", expanded=True):
+    col10, col11 = st.columns(2)
+
+    with col10:
         handelsregister_api_key = st.text_input(
             "Handelsregister.ai API Key",
             type="password",
         )
 
-    with col10:
+    with col11:
         claude_api_key = st.text_input(
             "Claude / Anthropic API Key",
             type="password",
         )
 
     claude_model_name = st.text_input(
-        "Claude model name",
+        "Claude business model name",
         value="claude-sonnet-4-5",
     )
 
+    scoring_model_name = st.text_input(
+        "Claude fit scoring model name",
+        value="claude-sonnet-4-5",
+        help="Recommended: claude-sonnet-4-5. Fit scoring uses structured company data.",
+    )
+
 st.warning(
-    "This will read the uploaded North Data file in order, update the master company database by Register ID, "
-    "run selected enrichments, save results to Supabase, and provide optional CSV backups."
+    "This reads the uploaded North Data file in order, updates the master company database by Register ID, "
+    "runs selected enrichment/scoring modules, saves results to Supabase, and provides optional CSV backups."
 )
 
 if st.button("Run Master Enrichment", type="primary"):
@@ -133,10 +146,10 @@ if st.button("Run Master Enrichment", type="primary"):
         st.error("Please upload a North Data XLSX file.")
     elif run_hr and not handelsregister_api_key:
         st.error("Please paste the Handelsregister.ai API key.")
-    elif run_claude and not claude_api_key:
+    elif (run_claude or run_fit_score) and not claude_api_key:
         st.error("Please paste the Claude / Anthropic API key.")
-    elif not run_hr and not run_claude:
-        st.error("Please select at least one enrichment module.")
+    elif not run_hr and not run_claude and not run_fit_score:
+        st.error("Please select at least one enrichment/scoring module.")
     else:
         try:
             log_box = st.empty()
@@ -144,7 +157,7 @@ if st.button("Run Master Enrichment", type="primary"):
 
             def log_callback(message):
                 logs.append(str(message))
-                log_box.text("\n".join(logs[-45:]))
+                log_box.text("\n".join(logs[-60:]))
 
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_dir = Path(temp_dir)
@@ -176,27 +189,65 @@ if st.button("Run Master Enrichment", type="primary"):
                     log_callback=log_callback,
                 )
 
-                log_callback("Starting enrichment...")
+                enrichment_result = None
+                fit_score_result = None
 
-                enrichment_result = run_combined_enrichment(
-                    supabase=supabase,
-                    companies=save_result["companies_for_enrichment"],
-                    handelsregister_api_key=handelsregister_api_key,
-                    claude_api_key=claude_api_key,
-                    claude_model_name=claude_model_name,
-                    run_handelsregister=run_hr,
-                    run_claude=run_claude,
-                    skip_existing_enrichment=(
-                        enrichment_behavior == "Skip existing enrichment"
-                    ),
-                    replace_existing_enrichment=(
-                        enrichment_behavior == "Replace existing enrichment"
-                    ),
-                    log_callback=log_callback,
-                )
+                if run_hr or run_claude:
+                    log_callback("Starting Handelsregister / Claude business enrichment...")
+
+                    enrichment_result = run_combined_enrichment(
+                        supabase=supabase,
+                        companies=save_result["companies_for_enrichment"],
+                        handelsregister_api_key=handelsregister_api_key,
+                        claude_api_key=claude_api_key,
+                        claude_model_name=claude_model_name,
+                        run_handelsregister=run_hr,
+                        run_claude=run_claude,
+                        skip_existing_enrichment=(
+                            enrichment_behavior == "Skip existing enrichment"
+                        ),
+                        replace_existing_enrichment=(
+                            enrichment_behavior == "Replace existing enrichment"
+                        ),
+                        log_callback=log_callback,
+                    )
+
+                    log_callback(
+                        "Business enrichment completed. "
+                        f"Processed: {enrichment_result.get('processed_companies', 0)} | "
+                        f"Shareholders: {enrichment_result.get('shareholder_rows', 0)} | "
+                        f"News: {enrichment_result.get('news_rows', 0)} | "
+                        f"Models: {enrichment_result.get('model_rows', 0)}"
+                    )
+
+                if run_fit_score:
+                    log_callback("Starting Claude fit scoring...")
+
+                    fit_score_result = run_fit_scoring(
+                        supabase=supabase,
+                        companies=save_result["companies_for_enrichment"],
+                        claude_api_key=claude_api_key,
+                        scoring_model_name=scoring_model_name,
+                        skip_existing_score=(
+                            enrichment_behavior == "Skip existing enrichment"
+                        ),
+                        replace_existing_score=(
+                            enrichment_behavior == "Replace existing enrichment"
+                        ),
+                        log_callback=log_callback,
+                    )
+
+                    log_callback(
+                        "Fit scoring completed. "
+                        f"Processed: {fit_score_result.get('processed', 0)} | "
+                        f"Scored: {fit_score_result.get('scored', 0)} | "
+                        f"Skipped: {fit_score_result.get('skipped', 0)} | "
+                        f"Errors: {fit_score_result.get('errors', 0)}"
+                    )
 
             st.session_state["last_save_result"] = save_result
             st.session_state["last_enrichment_result"] = enrichment_result
+            st.session_state["last_fit_score_result"] = fit_score_result
 
             st.success("Master enrichment completed.")
 
@@ -217,9 +268,9 @@ if "last_save_result" in st.session_state:
     st.write("Skipped existing companies:", save_result.get("skipped", ""))
 
 
-if "last_enrichment_result" in st.session_state:
+if "last_enrichment_result" in st.session_state and st.session_state["last_enrichment_result"]:
     st.divider()
-    st.subheader("Enrichment Result")
+    st.subheader("Business Enrichment Result")
 
     result = st.session_state["last_enrichment_result"]
 
@@ -264,12 +315,25 @@ if "last_enrichment_result" in st.session_state:
             key="download_claude_models_backup",
         )
 
+
+if "last_fit_score_result" in st.session_state and st.session_state["last_fit_score_result"]:
+    st.divider()
+    st.subheader("Fit Scoring Result")
+
+    fit_result = st.session_state["last_fit_score_result"]
+
+    st.write("Processed:", fit_result.get("processed", ""))
+    st.write("Scored:", fit_result.get("scored", ""))
+    st.write("Skipped:", fit_result.get("skipped", ""))
+    st.write("Errors:", fit_result.get("errors", ""))
+
+
 st.divider()
 st.subheader("Google Sheet Sync")
 
 st.caption(
     "This updates the fixed Google Sheet from Supabase. "
-    "It writes Overview, North Data Exports, Shareholders, News, Company Models, Processing Logs, and Cockpit."
+    "It writes Overview, North Data Exports, Shareholders, News, Company Models, Fit Scores, Processing Logs, and Cockpit."
 )
 
 if st.button("Sync Supabase to Google Sheet", type="secondary"):
@@ -279,7 +343,7 @@ if st.button("Sync Supabase to Google Sheet", type="secondary"):
 
         def sync_log(message):
             sync_logs.append(str(message))
-            sync_log_box.text("\n".join(sync_logs[-30:]))
+            sync_log_box.text("\n".join(sync_logs[-40:]))
 
         supabase = get_supabase_client()
 
@@ -298,4 +362,3 @@ if st.button("Sync Supabase to Google Sheet", type="secondary"):
     except Exception as e:
         st.error("Google Sheet sync failed.")
         st.exception(e)
-        
