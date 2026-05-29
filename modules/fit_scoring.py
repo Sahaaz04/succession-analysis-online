@@ -6,6 +6,20 @@ from anthropic import Anthropic
 from modules.helpers import clean_text, clean_id
 
 
+DEFAULT_FIT_CONFIG = {
+    "revenue_min": 4000000,
+    "revenue_max": 8000000,
+    "employees_min": 20,
+    "equity_ratio_min": 15,
+    "equity_ratio_good": 30,
+    "older_shareholder_age_from": 55,
+    "older_shareholder_age_high_from": 65,
+    "preferred_business_type": "B2B industrial company",
+    "preferred_industries": "cosmetics, food, contract manufacturing",
+    "profit_proxy_target": "around EUR 400k positive earnings/EBITDA proxy if EBITDA is unavailable",
+}
+
+
 def now_iso():
     return datetime.utcnow().isoformat()
 
@@ -28,19 +42,24 @@ def fetch_all_rows(supabase, table_name, filters=None, limit=1000):
 
 
 def get_latest_company_model(supabase, register_id):
-    rows = (
-        supabase.table("company_models")
-        .select("*")
-        .eq("company_register_id", register_id)
-        .eq("model_provider", "claude")
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
-        .data
-        or []
+    rows = fetch_all_rows(
+        supabase,
+        "company_models",
+        filters={
+            "company_register_id": register_id,
+            "model_provider": "claude",
+        },
+        limit=20,
     )
 
-    return rows[0] if rows else {}
+    if not rows:
+        return {}
+
+    return sorted(
+        rows,
+        key=lambda x: str(x.get("updated_at", "") or x.get("created_at", "")),
+        reverse=True,
+    )[0]
 
 
 def get_company_shareholders(supabase, register_id):
@@ -48,23 +67,23 @@ def get_company_shareholders(supabase, register_id):
         supabase,
         "shareholders",
         filters={"company_register_id": register_id},
-        limit=500,
+        limit=200,
     )
 
 
 def get_company_news(supabase, register_id):
-    rows = (
-        supabase.table("company_news")
-        .select("*")
-        .eq("company_register_id", register_id)
-        .order("date", desc=True)
-        .limit(10)
-        .execute()
-        .data
-        or []
+    rows = fetch_all_rows(
+        supabase,
+        "company_news",
+        filters={"company_register_id": register_id},
+        limit=50,
     )
 
-    return rows
+    return sorted(
+        rows,
+        key=lambda x: str(x.get("date", "") or x.get("retrieved_at", "")),
+        reverse=True,
+    )[:10]
 
 
 def summarize_shareholders(shareholders):
@@ -100,7 +119,7 @@ def summarize_shareholders(shareholders):
         "total_shareholders": total,
         "natural_shareholders": natural,
         "corporate_shareholders": corporate,
-        "shareholders": shareholder_lines,
+        "shareholders": shareholder_lines[:10],
     }
 
 
@@ -122,7 +141,7 @@ def summarize_news(news_rows):
     return output[:10]
 
 
-def build_fit_score_prompt(company, model_row, shareholders, news_rows, fit_criteria):
+def build_fit_score_prompt(company, model_row, shareholders, news_rows, fit_config):
     shareholder_summary = summarize_shareholders(shareholders)
     news_summary = summarize_news(news_rows)
 
@@ -135,11 +154,11 @@ def build_fit_score_prompt(company, model_row, shareholders, news_rows, fit_crit
             "website": safe(company.get("website")),
             "status": safe(company.get("status")),
         },
-        "business": {
+        "industry_and_business_model": {
             "wz_code": safe(company.get("wz_code")),
             "industry_segment": safe(company.get("industry_segment")),
             "north_data_business_segment": safe(company.get("business_segment")),
-            "claude_business_segment": safe(model_row.get("business_segment_claude")),
+            "claude_business_segment": safe(model_row.get("business_segment")),
             "north_data_subject": safe(company.get("subject")),
             "claude_detailed_business_model": safe(model_row.get("summary")),
         },
@@ -158,25 +177,34 @@ def build_fit_score_prompt(company, model_row, shareholders, news_rows, fit_crit
         },
         "shareholders": shareholder_summary,
         "news": news_summary,
-        "fit_criteria": fit_criteria or {},
+        "target_criteria": fit_config,
     }
 
     return f"""
-You are scoring German SMEs for acquisition/succession fit.
+You are scoring German companies for acquisition / succession fit.
 
 Use ONLY the provided company data. Do not invent facts.
 
 Score from 1 to 5:
-5 = Very high fit
-4 = High fit
-3 = Medium fit
-2 = Low fit
-1 = No fit
+5 = Very high fit: most criteria fulfilled, strong succession/acquisition potential, healthy company.
+4 = High fit: key criteria fulfilled, succession/acquisition potential visible.
+3 = Medium fit: some criteria fit, but important gaps or uncertainty.
+2 = Low fit: major criteria missing, weak fit.
+1 = No fit: clearly outside target profile or high-risk.
 
-Use the client-configured fit criteria below as the target profile:
-{json.dumps(fit_criteria or {}, ensure_ascii=False, indent=2)}
+Important scoring guidance:
+- Revenue target is driven by the user config.
+- Employee target is driven by the user config.
+- Positive earnings / profitability improves score.
+- Equity ratio above the configured threshold is good; lower values are weaker.
+- Older natural-person shareholders increase succession signal.
+- All natural-person ownership is stronger than mixed ownership; all corporate ownership is weaker.
+- Preferred industries and business type are driven by the user config.
+- Penalize unrelated sectors, distress/insolvency, negative earnings, very small size, and unclear model.
 
-Return ONLY valid JSON:
+Return ONLY valid JSON. No markdown. No explanation outside JSON.
+
+Required JSON schema:
 {{
   "fit_score": 1,
   "fit_label": "No Fit / Low Fit / Medium Fit / High Fit / Very High Fit",
@@ -215,7 +243,7 @@ def score_company_with_claude(
     model_row,
     shareholders,
     news_rows,
-    fit_criteria,
+    fit_config,
 ):
     client = Anthropic(api_key=str(api_key).strip())
 
@@ -224,12 +252,12 @@ def score_company_with_claude(
         model_row=model_row,
         shareholders=shareholders,
         news_rows=news_rows,
-        fit_criteria=fit_criteria,
+        fit_config=fit_config,
     )
 
     request_payload = {
         "model": model_name,
-        "max_tokens": 600,
+        "max_tokens": 700,
         "messages": [
             {
                 "role": "user",
@@ -244,7 +272,6 @@ def score_company_with_claude(
     response = client.messages.create(**request_payload)
 
     text_parts = []
-
     for block in response.content:
         if getattr(block, "type", "") == "text":
             text_parts.append(block.text)
@@ -298,13 +325,15 @@ def run_fit_scoring(
     companies,
     claude_api_key,
     scoring_model_name="claude-sonnet-4-5",
-    fit_criteria=None,
+    fit_config=None,
     skip_existing_score=True,
     replace_existing_score=False,
     log_callback=None,
 ):
     if not claude_api_key:
         raise ValueError("Claude API key is missing.")
+
+    fit_config = {**DEFAULT_FIT_CONFIG, **(fit_config or {})}
 
     processed = 0
     scored = 0
@@ -352,7 +381,7 @@ def run_fit_scoring(
                 model_row=model_row,
                 shareholders=shareholders,
                 news_rows=news_rows,
-                fit_criteria=fit_criteria,
+                fit_config=fit_config,
             )
 
             fit_score = parsed.get("fit_score")
@@ -384,11 +413,12 @@ def run_fit_scoring(
                 "model_name": scoring_model_name,
                 "api_status": "OK",
                 "notes": "",
+                "scoring_config": fit_config,
                 "raw_data": {
                     "parsed": parsed,
                     "raw_response": raw_response,
-                    "fit_criteria": fit_criteria or {},
                 },
+                "created_at": now_iso(),
                 "updated_at": now_iso(),
             }
 
@@ -397,9 +427,7 @@ def run_fit_scoring(
             scored += 1
 
             if log_callback:
-                log_callback(
-                    f"Saved fit score: {fit_score} | {row['fit_label']}"
-                )
+                log_callback(f"Saved fit score: {fit_score} | {row['fit_label']}")
 
         except Exception as e:
             errors += 1
@@ -419,10 +447,11 @@ def run_fit_scoring(
                 "model_name": scoring_model_name,
                 "api_status": "ERROR",
                 "notes": str(e)[:1000],
+                "scoring_config": fit_config,
                 "raw_data": {
                     "error": str(e),
-                    "fit_criteria": fit_criteria or {},
                 },
+                "created_at": now_iso(),
                 "updated_at": now_iso(),
             }
 
