@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 
 import gspread
 import pandas as pd
@@ -78,6 +79,7 @@ HEADER_RENAMES = {
     "industry_segment": "Industry Segment",
     "wz_code": "WZ Code",
     "business_segment": "Business Segment",
+    "business_segment_claude": "Claude Business Segment",
     "subject": "Business Model",
     "detailed_business_model": "Detailed Business Model",
     "summary": "Detailed Business Model",
@@ -138,6 +140,7 @@ HEADER_RENAMES = {
     "retrieved_at": "Retrieved At",
     "company_updated_at": "Company Updated At",
     "model_updated_at": "Model Updated At",
+    "score_updated_at": "Score Updated At",
     "last_updated_at": "Last Updated At",
     "module": "Module",
     "message": "Message",
@@ -158,6 +161,7 @@ OVERVIEW_HEADERS = [
     "Legal Form",
     "WZ Code",
     "Business Segment",
+    "Claude Business Segment",
     "Business Model",
     "Detailed Business Model",
     "City",
@@ -168,7 +172,9 @@ OVERVIEW_HEADERS = [
     "Equity Ratio %",
     "Financial Data Year",
     "Number of Employees",
-    "Number of Shareholders",
+    "Total Shareholders",
+    "Natural Shareholders",
+    "Corporate Shareholders",
     "Shareholder Name",
     "Shareholder Age",
     "Shareholder Type",
@@ -319,11 +325,21 @@ def get_latest_model_for_register(company_models, register_id):
     if not matches:
         return {}
 
-    return sorted(
+    latest = sorted(
         matches,
         key=lambda x: str(x.get("created_at", "")),
         reverse=True,
     )[0]
+
+    raw_data = latest.get("raw_data") or {}
+    if isinstance(raw_data, str):
+        try:
+            raw_data = json.loads(raw_data)
+        except Exception:
+            raw_data = {}
+
+    latest["business_segment_claude"] = raw_data.get("business_segment_claude", "")
+    return latest
 
 
 def get_latest_fit_score_for_register(fit_scores, register_id):
@@ -382,31 +398,22 @@ def get_default_news(news_by_register, register_id):
     )[0]
 
 
-def build_shareholder_count_text(shareholders_by_register, register_id):
+def build_shareholder_counts(shareholders_by_register, register_id):
     rows = shareholders_by_register.get(register_id, [])
-
-    rows = [
-        row for row in rows
-        if str(row.get("shareholder_name", "")).strip()
-    ]
+    rows = [row for row in rows if str(row.get("shareholder_name", "")).strip()]
 
     total = len(rows)
-
-    if total == 0:
-        return ""
-
     natural = 0
     corporate = 0
 
     for row in rows:
         sh_type = str(row.get("shareholder_type", "")).lower()
-
         if "natural" in sh_type:
             natural += 1
         elif "corporate" in sh_type:
             corporate += 1
 
-    return f"{total} ({natural} Natural + {corporate} Corporate)"
+    return total, natural, corporate
 
 
 def build_overview_values(
@@ -440,17 +447,25 @@ def build_overview_values(
         shareholder = get_default_shareholder(shareholders_by_register, register_id)
         news = get_default_news(news_by_register, register_id)
 
-        next_row_number = len(values) + 1
+        total_sh, natural_sh, corporate_sh = build_shareholder_counts(
+            shareholders_by_register,
+            register_id,
+        )
 
-        # Overview column positions:
-        # K = Total Assets EUR, L = Equity EUR, M = Equity Ratio %
-        equity_ratio_formula = f'=IFERROR(L{next_row_number}/K{next_row_number},"")'
+        next_row_number = len(values) + 1
+        equity_ratio_formula = f'=IFERROR(M{next_row_number}/L{next_row_number},"")'
 
         company_updated_at = str(company.get("updated_at", ""))
         model_updated_at = str(model.get("created_at", ""))
-        score_updated_at = str(fit_score.get("updated_at", "") or fit_score.get("created_at", ""))
+        score_updated_at = str(
+            fit_score.get("updated_at", "") or fit_score.get("created_at", "")
+        )
 
-        last_updated_at = max(company_updated_at, model_updated_at, score_updated_at)
+        last_updated_at = max(
+            company_updated_at,
+            model_updated_at,
+            score_updated_at,
+        )
 
         row = [
             register_id,
@@ -458,6 +473,7 @@ def build_overview_values(
             company.get("legal_form", ""),
             company.get("wz_code", ""),
             company.get("business_segment", ""),
+            model.get("business_segment_claude", ""),
             company.get("subject", ""),
             model.get("summary", ""),
             company.get("city", ""),
@@ -468,7 +484,9 @@ def build_overview_values(
             equity_ratio_formula,
             company.get("financials_date", ""),
             company.get("employee_number", ""),
-            build_shareholder_count_text(shareholders_by_register, register_id),
+            total_sh,
+            natural_sh,
+            corporate_sh,
             shareholder.get("shareholder_name", ""),
             shareholder.get("age", ""),
             shareholder.get("shareholder_type", ""),
@@ -510,35 +528,38 @@ def build_cockpit_values():
         ["Legal Form", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$C:$C),"")'],
         ["WZ Code", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$D:$D),"")'],
         ["Business Segment", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$E:$E),"")'],
-        ["Business Model", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$F:$F),"")'],
-        ["Detailed Business Model", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$G:$G),"")'],
-        ["City", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$H:$H),"")'],
-        ["Revenue EUR", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$I:$I),"")'],
-        ["Net Income EUR", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$J:$J),"")'],
-        ["Total Assets EUR", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$K:$K),"")'],
-        ["Equity EUR", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$L:$L),"")'],
-        ["Equity Ratio %", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$M:$M),"")'],
-        ["Financial Data Year", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$N:$N),"")'],
-        ["Number of Employees", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$O:$O),"")'],
-        ["Number of Shareholders", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$P:$P),"")'],
-        ["Shareholder Name", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Q:$Q),"")'],
-        ["Shareholder Age", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$R:$R),"")'],
-        ["Shareholder Type", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$S:$S),"")'],
-        ["Shareholder Contribution", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$T:$T),"")'],
-        ["Shareholder Ownership %", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$U:$U),"")'],
-        ["News Title", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$V:$V),"")'],
-        ["News Date", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$W:$W),"")'],
-        ["News Type", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$X:$X),"")'],
-        ["News URL", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Y:$Y),"")'],
-        ["Website", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Z:$Z),"")'],
-        ["Fit Score", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AA:$AA),"")'],
-        ["Fit Label", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AB:$AB),"")'],
-        ["Fit Comment", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AC:$AC),"")'],
-        ["Succession Signal", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AD:$AD),"")'],
-        ["Financial Signal", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AE:$AE),"")'],
-        ["Shareholder Signal", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AF:$AF),"")'],
-        ["Risk Flags", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AG:$AG),"")'],
-        ["Recommended Action", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AH:$AH),"")'],
+        ["Claude Business Segment", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$F:$F),"")'],
+        ["Business Model", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$G:$G),"")'],
+        ["Detailed Business Model", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$H:$H),"")'],
+        ["City", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$I:$I),"")'],
+        ["Revenue EUR", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$J:$J),"")'],
+        ["Net Income EUR", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$K:$K),"")'],
+        ["Total Assets EUR", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$L:$L),"")'],
+        ["Equity EUR", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$M:$M),"")'],
+        ["Equity Ratio %", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$N:$N),"")'],
+        ["Financial Data Year", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$O:$O),"")'],
+        ["Number of Employees", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$P:$P),"")'],
+        ["Total Shareholders", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Q:$Q),"")'],
+        ["Natural Shareholders", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$R:$R),"")'],
+        ["Corporate Shareholders", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$S:$S),"")'],
+        ["Shareholder Name", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$T:$T),"")'],
+        ["Shareholder Age", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$U:$U),"")'],
+        ["Shareholder Type", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$V:$V),"")'],
+        ["Shareholder Contribution", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$W:$W),"")'],
+        ["Shareholder Ownership %", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$X:$X),"")'],
+        ["News Title", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Y:$Y),"")'],
+        ["News Date", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$Z:$Z),"")'],
+        ["News Type", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AA:$AA),"")'],
+        ["News URL", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AB:$AB),"")'],
+        ["Website", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AC:$AC),"")'],
+        ["Fit Score", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AD:$AD),"")'],
+        ["Fit Label", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AE:$AE),"")'],
+        ["Fit Comment", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AF:$AF),"")'],
+        ["Succession Signal", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AG:$AG),"")'],
+        ["Financial Signal", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AH:$AH),"")'],
+        ["Shareholder Signal", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AI:$AI),"")'],
+        ["Risk Flags", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AJ:$AJ),"")'],
+        ["Recommended Action", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AK:$AK),"")'],
     ]
 
 
@@ -599,7 +620,7 @@ def format_overview_sheet(worksheet):
 
     try:
         worksheet.format(
-            "M:M",
+            "N:N",
             {
                 "numberFormat": {
                     "type": "PERCENT",
@@ -636,16 +657,16 @@ def format_cockpit_sheet(worksheet):
             },
         )
         worksheet.format(
-            "A:A",
-            {
-                "textFormat": {"bold": True},
-            },
-        )
-        worksheet.format(
             "A:B",
             {
                 "wrapStrategy": "WRAP",
                 "verticalAlignment": "MIDDLE",
+            },
+        )
+        worksheet.format(
+            "A:A",
+            {
+                "textFormat": {"bold": True},
             },
         )
     except Exception:
