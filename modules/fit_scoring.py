@@ -48,7 +48,7 @@ def get_company_shareholders(supabase, register_id):
         supabase,
         "shareholders",
         filters={"company_register_id": register_id},
-        limit=200,
+        limit=500,
     )
 
 
@@ -122,7 +122,7 @@ def summarize_news(news_rows):
     return output[:10]
 
 
-def build_fit_score_prompt(company, model_row, shareholders, news_rows):
+def build_fit_score_prompt(company, model_row, shareholders, news_rows, fit_criteria):
     shareholder_summary = summarize_shareholders(shareholders)
     news_summary = summarize_news(news_rows)
 
@@ -135,10 +135,11 @@ def build_fit_score_prompt(company, model_row, shareholders, news_rows):
             "website": safe(company.get("website")),
             "status": safe(company.get("status")),
         },
-        "industry_and_business_model": {
+        "business": {
             "wz_code": safe(company.get("wz_code")),
             "industry_segment": safe(company.get("industry_segment")),
-            "business_segment": safe(company.get("business_segment")),
+            "north_data_business_segment": safe(company.get("business_segment")),
+            "claude_business_segment": safe(model_row.get("business_segment_claude")),
             "north_data_subject": safe(company.get("subject")),
             "claude_detailed_business_model": safe(model_row.get("summary")),
         },
@@ -157,15 +158,7 @@ def build_fit_score_prompt(company, model_row, shareholders, news_rows):
         },
         "shareholders": shareholder_summary,
         "news": news_summary,
-        "target_criteria": {
-            "revenue_sweet_spot": "EUR 4M to EUR 8M",
-            "profit_proxy_target": "around EUR 400k positive earnings/EBITDA proxy if EBITDA unavailable",
-            "employees": "more than 20 FTE preferred",
-            "preferred_type": "B2B industrial company",
-            "preferred_industries": "cosmetics, food, other contract manufacturing",
-            "succession_signal": "older natural-person shareholders, family ownership, management handover, ownership transition, or succession-related news are positive signals",
-            "risk_penalties": "insolvency, distress, negative profitability, very small company size, all-corporate ownership, no clear business model, unrelated industry",
-        },
+        "fit_criteria": fit_criteria or {},
     }
 
     return f"""
@@ -174,25 +167,16 @@ You are scoring German SMEs for acquisition/succession fit.
 Use ONLY the provided company data. Do not invent facts.
 
 Score from 1 to 5:
-5 = Very high fit: most criteria fulfilled, strong succession/acquisition potential, healthy company.
-4 = High fit: key criteria fulfilled, succession/acquisition potential visible.
-3 = Medium fit: some criteria fit, but important gaps or uncertainty.
-2 = Low fit: major criteria missing, weak fit.
-1 = No fit: clearly outside target profile or high-risk.
+5 = Very high fit
+4 = High fit
+3 = Medium fit
+2 = Low fit
+1 = No fit
 
-Important scoring guidance:
-- Revenue sweet spot is EUR 4M–8M.
-- Employee target is >20 FTE.
-- Positive earnings/profitability improves score.
-- Equity ratio above 30% is good, 15–30% medium, below 15% weak.
-- Older natural-person shareholders increase succession signal.
-- All natural-person ownership is stronger than mixed ownership; all corporate ownership is weaker.
-- Preferred sectors include cosmetics, food, industrial production, B2B, and contract manufacturing.
-- Penalize unrelated sectors, distress/insolvency, negative earnings, very small size, and unclear model.
+Use the client-configured fit criteria below as the target profile:
+{json.dumps(fit_criteria or {}, ensure_ascii=False, indent=2)}
 
-Return ONLY valid JSON. No markdown. No explanation outside JSON.
-
-Required JSON schema:
+Return ONLY valid JSON:
 {{
   "fit_score": 1,
   "fit_label": "No Fit / Low Fit / Medium Fit / High Fit / Very High Fit",
@@ -231,6 +215,7 @@ def score_company_with_claude(
     model_row,
     shareholders,
     news_rows,
+    fit_criteria,
 ):
     client = Anthropic(api_key=str(api_key).strip())
 
@@ -239,6 +224,7 @@ def score_company_with_claude(
         model_row=model_row,
         shareholders=shareholders,
         news_rows=news_rows,
+        fit_criteria=fit_criteria,
     )
 
     request_payload = {
@@ -252,7 +238,6 @@ def score_company_with_claude(
         ],
     }
 
-    # Opus 4.7 rejects temperature; Sonnet currently works with it.
     if "opus-4-7" not in str(model_name).lower():
         request_payload["temperature"] = 0.1
 
@@ -313,6 +298,7 @@ def run_fit_scoring(
     companies,
     claude_api_key,
     scoring_model_name="claude-sonnet-4-5",
+    fit_criteria=None,
     skip_existing_score=True,
     replace_existing_score=False,
     log_callback=None,
@@ -366,6 +352,7 @@ def run_fit_scoring(
                 model_row=model_row,
                 shareholders=shareholders,
                 news_rows=news_rows,
+                fit_criteria=fit_criteria,
             )
 
             fit_score = parsed.get("fit_score")
@@ -400,6 +387,7 @@ def run_fit_scoring(
                 "raw_data": {
                     "parsed": parsed,
                     "raw_response": raw_response,
+                    "fit_criteria": fit_criteria or {},
                 },
                 "updated_at": now_iso(),
             }
@@ -433,6 +421,7 @@ def run_fit_scoring(
                 "notes": str(e)[:1000],
                 "raw_data": {
                     "error": str(e),
+                    "fit_criteria": fit_criteria or {},
                 },
                 "updated_at": now_iso(),
             }
