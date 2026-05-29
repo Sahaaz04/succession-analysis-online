@@ -1,7 +1,9 @@
-import json
+import io
+import re
 from pathlib import Path
 import tempfile
 
+import pandas as pd
 import streamlit as st
 
 from modules.supabase_client import get_supabase_client
@@ -11,7 +13,10 @@ from modules.northdata_to_supabase import (
 )
 from modules.enrichment_to_supabase import run_combined_enrichment
 from modules.fit_scoring import run_fit_scoring
-from modules.google_sheets_sync import sync_supabase_to_google_sheet
+from modules.google_sheets_sync import (
+    sync_supabase_to_google_sheet,
+    HEADER_RENAMES as SHEET_HEADER_RENAMES,
+)
 
 
 st.set_page_config(
@@ -22,19 +27,83 @@ st.set_page_config(
 st.title("Succession Analysis Online Tool")
 st.subheader("Master Company Enrichment")
 
-default_fit_criteria = {
-    "revenue": {"op": "between", "min": 4000000, "max": 8000000},
-    "employees": {"op": ">=", "value": 20},
-    "earnings": {"op": ">=", "value": 0},
-    "equity_ratio_percent": {"op": ">=", "value": 15},
-    "shareholders_total": {"op": ">=", "value": 1},
-    "shareholders_natural": {"op": ">=", "value": 1},
-    "shareholders_corporate": {"op": "<=", "value": 3},
-    "preferred_segments": ["food", "cosmetics", "industrial", "contract manufacturing"],
-}
 
-if "fit_criteria_text" not in st.session_state:
-    st.session_state["fit_criteria_text"] = json.dumps(default_fit_criteria, indent=2)
+def nowish_log_box():
+    return st.empty()
+
+
+def to_float(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    text = text.replace("€", "").replace("%", "").replace(",", "")
+    match = re.search(r"-?\d+(\.\d+)?", text)
+    if not match:
+        return None
+
+    try:
+        return float(match.group())
+    except Exception:
+        return None
+
+
+def apply_numeric_filter(df, column, operator, value1=None, value2=None):
+    if operator == "Ignore":
+        return df
+
+    series = df[column].apply(to_float)
+
+    if operator == "=":
+        return df[series == value1]
+    if operator == ">":
+        return df[series > value1]
+    if operator == ">=":
+        return df[series >= value1]
+    if operator == "<":
+        return df[series < value1]
+    if operator == "<=":
+        return df[series <= value1]
+    if operator == "Between":
+        if value1 is None or value2 is None:
+            return df
+        return df[(series >= value1) & (series <= value2)]
+
+    return df
+
+
+def fetch_all_rows_paginated(supabase, table_name, chunk_size=1000):
+    all_rows = []
+    start = 0
+
+    while True:
+        end = start + chunk_size - 1
+        response = (
+            supabase.table(table_name)
+            .select("*")
+            .range(start, end)
+            .execute()
+        )
+        rows = response.data or []
+        if not rows:
+            break
+        all_rows.extend(rows)
+        if len(rows) < chunk_size:
+            break
+        start += chunk_size
+
+    return all_rows
+
+
+def pretty_export_dataframe(df):
+    def rename_col(col):
+        return SHEET_HEADER_RENAMES.get(col, str(col).replace("_", " ").title())
+
+    return df.rename(columns={c: rename_col(c) for c in df.columns})
+
 
 north_data_file = st.file_uploader(
     "Upload North Data XLSX",
@@ -46,28 +115,16 @@ with st.expander("Column mapping", expanded=True):
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        register_id_column = st.text_input(
-            "Register ID column",
-            value="Register ID",
-        )
+        register_id_column = st.text_input("Register ID column", value="Register ID")
 
     with col2:
-        company_column = st.text_input(
-            "Company name column",
-            value="Name",
-        )
+        company_column = st.text_input("Company name column", value="Name")
 
     with col3:
-        city_column = st.text_input(
-            "City column",
-            value="City",
-        )
+        city_column = st.text_input("City column", value="City")
 
     with col4:
-        website_column = st.text_input(
-            "Website column",
-            value="Website",
-        )
+        website_column = st.text_input("Website column", value="Website")
 
 with st.expander("Run settings", expanded=True):
     col5, col6 = st.columns(2)
@@ -126,17 +183,64 @@ with st.expander("Run settings", expanded=True):
             value=False,
         )
 
-with st.expander("Fit score criteria", expanded=False):
-    st.caption(
-        "Edit these thresholds later without changing code. "
-        "The JSON is read only when fit scoring runs."
-    )
+with st.expander("Fit score settings", expanded=False):
+    c1, c2, c3 = st.columns(3)
 
-    st.session_state["fit_criteria_text"] = st.text_area(
-        "Fit score criteria JSON",
-        value=st.session_state["fit_criteria_text"],
-        height=280,
-    )
+    with c1:
+        revenue_min = st.number_input(
+            "Revenue minimum EUR",
+            min_value=0.0,
+            value=4000000.0,
+            step=100000.0,
+        )
+        revenue_max = st.number_input(
+            "Revenue maximum EUR",
+            min_value=0.0,
+            value=8000000.0,
+            step=100000.0,
+        )
+        employees_min = st.number_input(
+            "Minimum employees",
+            min_value=0,
+            value=20,
+            step=1,
+        )
+
+    with c2:
+        equity_ratio_min = st.number_input(
+            "Minimum equity ratio %",
+            min_value=0.0,
+            value=15.0,
+            step=1.0,
+        )
+        equity_ratio_good = st.number_input(
+            "Good equity ratio %",
+            min_value=0.0,
+            value=30.0,
+            step=1.0,
+        )
+        older_shareholder_age_from = st.number_input(
+            "Older shareholder age from",
+            min_value=0,
+            value=55,
+            step=1,
+        )
+
+    with c3:
+        older_shareholder_age_high_from = st.number_input(
+            "High succession age from",
+            min_value=0,
+            value=65,
+            step=1,
+        )
+        preferred_business_type = st.text_input(
+            "Preferred business type",
+            value="B2B industrial company",
+        )
+        preferred_industries = st.text_input(
+            "Preferred industries",
+            value="cosmetics, food, contract manufacturing",
+        )
 
 with st.expander("API keys", expanded=True):
     col10, col11 = st.columns(2)
@@ -161,8 +265,20 @@ with st.expander("API keys", expanded=True):
     scoring_model_name = st.text_input(
         "Claude fit scoring model name",
         value="claude-sonnet-4-5",
-        help="Recommended: claude-sonnet-4-5. Fit scoring uses structured company data.",
+        help="Recommended: claude-sonnet-4-5.",
     )
+
+fit_config = {
+    "revenue_min": revenue_min,
+    "revenue_max": revenue_max,
+    "employees_min": employees_min,
+    "equity_ratio_min": equity_ratio_min,
+    "equity_ratio_good": equity_ratio_good,
+    "older_shareholder_age_from": older_shareholder_age_from,
+    "older_shareholder_age_high_from": older_shareholder_age_high_from,
+    "preferred_business_type": preferred_business_type,
+    "preferred_industries": preferred_industries,
+}
 
 st.warning(
     "This reads the uploaded North Data file in order, updates the master company database by Register ID, "
@@ -180,15 +296,7 @@ if st.button("Run Master Enrichment", type="primary"):
         st.error("Please select at least one enrichment/scoring module.")
     else:
         try:
-            fit_criteria = None
-            if run_fit_score:
-                try:
-                    fit_criteria = json.loads(st.session_state["fit_criteria_text"])
-                except Exception as e:
-                    st.error(f"Fit score criteria JSON is invalid: {e}")
-                    st.stop()
-
-            log_box = st.empty()
+            log_box = nowish_log_box()
             logs = []
 
             def log_callback(message):
@@ -264,7 +372,7 @@ if st.button("Run Master Enrichment", type="primary"):
                         companies=save_result["companies_for_enrichment"],
                         claude_api_key=claude_api_key,
                         scoring_model_name=scoring_model_name,
-                        fit_criteria=fit_criteria,
+                        fit_config=fit_config,
                         skip_existing_score=(
                             enrichment_behavior == "Skip existing enrichment"
                         ),
@@ -398,4 +506,108 @@ if st.button("Sync Supabase to Google Sheet", type="secondary"):
 
     except Exception as e:
         st.error("Google Sheet sync failed.")
+        st.exception(e)
+
+
+st.divider()
+st.subheader("Filtered Database Export")
+
+st.caption(
+    "Create a filtered CSV from the whole database using master_overview."
+)
+
+with st.form("filtered_export_form"):
+    seg_mode = st.selectbox(
+        "North Data segment filter",
+        ["Ignore", "Contains", "Equals"],
+        index=0,
+    )
+    seg_value = st.text_input("North Data segment value")
+
+    fields = [
+        ("Revenue EUR", "revenue_eur", 100000.0),
+        ("Net Income EUR", "net_income_eur", 100000.0),
+        ("Total Assets EUR", "total_assets_eur", 100000.0),
+        ("Equity EUR", "equity_eur", 100000.0),
+        ("Equity Ratio %", "equity_ratio_percent", 1.0),
+        ("Total Shareholders", "total_shareholders", 1.0),
+        ("Natural Shareholders", "natural_shareholders", 1.0),
+        ("Corporate Shareholders", "corporate_shareholders", 1.0),
+    ]
+
+    filter_specs = {}
+    for label, key, step in fields:
+        st.markdown(f"**{label}**")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            op = st.selectbox(
+                "Operator",
+                ["Ignore", "=", ">", ">=", "<", "<=", "Between"],
+                key=f"{key}_op",
+            )
+        with c2:
+            v1 = st.number_input(
+                "Value",
+                value=0.0,
+                step=step,
+                key=f"{key}_v1",
+            )
+        with c3:
+            v2 = st.number_input(
+                "Upper value",
+                value=0.0,
+                step=step,
+                key=f"{key}_v2",
+            )
+        filter_specs[key] = {
+            "operator": op,
+            "value1": v1,
+            "value2": v2,
+        }
+
+    generate_export = st.form_submit_button("Generate filtered CSV")
+
+if generate_export:
+    try:
+        supabase = get_supabase_client()
+        rows = fetch_all_rows_paginated(supabase, "master_overview")
+        df = pd.DataFrame(rows)
+
+        if df.empty:
+            st.warning("No data found in master_overview.")
+        else:
+            if seg_mode != "Ignore" and seg_value.strip():
+                seg_col = "north_data_business_segment"
+                if seg_col in df.columns:
+                    if seg_mode == "Contains":
+                        df = df[df[seg_col].fillna("").astype(str).str.contains(seg_value, case=False, na=False)]
+                    elif seg_mode == "Equals":
+                        df = df[df[seg_col].fillna("").astype(str).str.lower() == seg_value.strip().lower()]
+
+            for col_key, spec in filter_specs.items():
+                operator = spec["operator"]
+                value1 = spec["value1"]
+                value2 = spec["value2"]
+                if operator == "Ignore":
+                    continue
+
+                if col_key in df.columns:
+                    df = apply_numeric_filter(df, col_key, operator, value1, value2)
+
+            df = df.sort_values(by=[c for c in ["company_name", "register_id"] if c in df.columns])
+
+            df = pretty_export_dataframe(df)
+
+            csv_bytes = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+            st.success(f"Filtered rows: {len(df)}")
+            st.download_button(
+                "Download filtered CSV",
+                data=csv_bytes,
+                file_name="filtered_database_export.csv",
+                mime="text/csv",
+                key="download_filtered_export",
+            )
+    except Exception as e:
+        st.error("Filtered export failed.")
         st.exception(e)
