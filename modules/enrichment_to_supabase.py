@@ -1,7 +1,7 @@
 import re
 import csv
 import time
-import hashlib
+import json
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
@@ -91,13 +91,20 @@ def now_iso():
 
 
 def safe(value):
-    return "" if value is None else str(value).strip()
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def make_dedupe_key(*parts):
     raw = "|".join(safe(part).lower() for part in parts)
     raw = re.sub(r"\s+", " ", raw).strip()
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+    return hashlib_md5(raw)
+
+
+def hashlib_md5(text):
+    import hashlib
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
 def clean_company_name(name):
@@ -857,21 +864,20 @@ def scrape_website(url, log_callback=None):
 
 def build_claude_prompt(company_name, url, website_text):
     return f"""
-You are a business research analyst doing company profiling for succession analysis.
+You are a business research analyst.
 
-Analyze the website text below and write a concise company profile.
+Analyze the website text below and return ONLY valid JSON with these keys:
+
+{{
+  "summary": "50-100 word concise company profile",
+  "business_segment_claude": "one short line like food products - meat or food products - chocolate"
+}}
 
 Rules:
 - Use only information supported by the website text.
-- Do not invent ownership, management, manufacturing, or business model details.
-- If something is unclear, say it is not clearly stated on the website.
-- Final answer must be 50–100 words.
-- Mention what the company does.
-- Mention its business model.
-- Mention its niche or specialization.
-- Mention whether it appears B2B, B2C, or mixed.
-- Mention whether it appears to be a manufacturer, service provider, distributor, e-commerce business, clinic/practice, or mixed.
-- Avoid generic marketing language.
+- Do not invent facts.
+- If unclear, say so in the summary.
+- Keep business_segment_claude short and practical.
 
 Company name:
 {company_name}
@@ -881,17 +887,30 @@ Website:
 
 Website text:
 {website_text}
-
-Write only the final 50–100 word company profile.
 """.strip()
+
+
+def parse_claude_json(text):
+    text = text.strip()
+
+    if text.startswith("```"):
+        text = text.replace("```json", "").replace("```", "").strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start >= 0 and end >= 0:
+        text = text[start:end + 1]
+
+    return json.loads(text)
 
 
 def summarize_with_claude(api_key, model_name, company_name, url, website_text, log_callback=None):
     if not url:
-        return "No website provided.", "NO_WEBSITE", "No website provided."
+        return "No website provided.", "", "NO_WEBSITE", "No website provided."
 
     if not website_text:
-        return "No website text extracted.", "NO_TEXT", "No website text extracted."
+        return "No website text extracted.", "", "NO_TEXT", "No website text extracted."
 
     client = Anthropic(api_key=str(api_key).strip())
     prompt = build_claude_prompt(company_name, url, website_text)
@@ -899,7 +918,7 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
     try:
         request_payload = {
             "model": model_name,
-            "max_tokens": 250,
+            "max_tokens": 300,
             "messages": [
                 {
                     "role": "user",
@@ -908,8 +927,6 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
             ],
         }
 
-        # Opus 4.7 rejects temperature.
-        # Sonnet/older models can still use it.
         if "opus-4-7" not in str(model_name).lower():
             request_payload["temperature"] = 0.2
 
@@ -921,18 +938,22 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
             if getattr(block, "type", "") == "text":
                 text_parts.append(block.text)
 
-        summary = "\n".join(text_parts).strip()
+        response_text = "\n".join(text_parts).strip()
 
-        if not summary:
-            return "CLAUDE_ERROR: Empty response.", "CLAUDE_ERROR", "Empty response"
+        if not response_text:
+            return "CLAUDE_ERROR: Empty response.", "", "CLAUDE_ERROR", "Empty response"
 
-        return summary, "OK", ""
+        parsed = parse_claude_json(response_text)
+        summary = parsed.get("summary", "").strip() or response_text
+        business_segment_claude = parsed.get("business_segment_claude", "").strip()
+
+        return summary, business_segment_claude, "OK", ""
 
     except Exception as e:
         if log_callback:
             log_callback(f"Claude error: {e}")
 
-        return f"CLAUDE_ERROR: {e}", "CLAUDE_ERROR", str(e)
+        return f"CLAUDE_ERROR: {e}", "", "CLAUDE_ERROR", str(e)
 
 
 def table_has_row(supabase, table_name, filters):
@@ -1170,6 +1191,7 @@ def run_combined_enrichment(
 
                 if not website:
                     summary = "No website provided."
+                    business_segment_claude = ""
                     api_status = "NO_WEBSITE"
                     notes = "No website provided in North Data export."
 
@@ -1181,11 +1203,12 @@ def run_combined_enrichment(
 
                     if scrape_status != "OK":
                         summary = f"SCRAPE_ERROR: {scrape_notes}"
+                        business_segment_claude = ""
                         api_status = "SCRAPE_ERROR"
                         notes = scrape_notes
 
                     else:
-                        summary, api_status, notes = summarize_with_claude(
+                        summary, business_segment_claude, api_status, notes = summarize_with_claude(
                             api_key=claude_api_key,
                             model_name=claude_model_name,
                             company_name=company_name,
@@ -1208,6 +1231,7 @@ def run_combined_enrichment(
                         "website": website,
                         "company_name": company_name,
                         "model": claude_model_name,
+                        "business_segment_claude": business_segment_claude,
                     },
                     "_source_row": source_row,
                 }
