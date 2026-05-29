@@ -1,6 +1,8 @@
-import streamlit as st
+import json
 from pathlib import Path
 import tempfile
+
+import streamlit as st
 
 from modules.supabase_client import get_supabase_client
 from modules.northdata_to_supabase import (
@@ -19,6 +21,20 @@ st.set_page_config(
 
 st.title("Succession Analysis Online Tool")
 st.subheader("Master Company Enrichment")
+
+default_fit_criteria = {
+    "revenue": {"op": "between", "min": 4000000, "max": 8000000},
+    "employees": {"op": ">=", "value": 20},
+    "earnings": {"op": ">=", "value": 0},
+    "equity_ratio_percent": {"op": ">=", "value": 15},
+    "shareholders_total": {"op": ">=", "value": 1},
+    "shareholders_natural": {"op": ">=", "value": 1},
+    "shareholders_corporate": {"op": "<=", "value": 3},
+    "preferred_segments": ["food", "cosmetics", "industrial", "contract manufacturing"],
+}
+
+if "fit_criteria_text" not in st.session_state:
+    st.session_state["fit_criteria_text"] = json.dumps(default_fit_criteria, indent=2)
 
 north_data_file = st.file_uploader(
     "Upload North Data XLSX",
@@ -110,6 +126,18 @@ with st.expander("Run settings", expanded=True):
             value=False,
         )
 
+with st.expander("Fit score criteria", expanded=False):
+    st.caption(
+        "Edit these thresholds later without changing code. "
+        "The JSON is read only when fit scoring runs."
+    )
+
+    st.session_state["fit_criteria_text"] = st.text_area(
+        "Fit score criteria JSON",
+        value=st.session_state["fit_criteria_text"],
+        height=280,
+    )
+
 with st.expander("API keys", expanded=True):
     col10, col11 = st.columns(2)
 
@@ -152,6 +180,14 @@ if st.button("Run Master Enrichment", type="primary"):
         st.error("Please select at least one enrichment/scoring module.")
     else:
         try:
+            fit_criteria = None
+            if run_fit_score:
+                try:
+                    fit_criteria = json.loads(st.session_state["fit_criteria_text"])
+                except Exception as e:
+                    st.error(f"Fit score criteria JSON is invalid: {e}")
+                    st.stop()
+
             log_box = st.empty()
             logs = []
 
@@ -228,6 +264,7 @@ if st.button("Run Master Enrichment", type="primary"):
                         companies=save_result["companies_for_enrichment"],
                         claude_api_key=claude_api_key,
                         scoring_model_name=scoring_model_name,
+                        fit_criteria=fit_criteria,
                         skip_existing_score=(
                             enrichment_behavior == "Skip existing enrichment"
                         ),
