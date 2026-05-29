@@ -1,5 +1,4 @@
 from datetime import datetime, timezone
-import json
 
 import gspread
 import pandas as pd
@@ -77,9 +76,10 @@ HEADER_RENAMES = {
     "website": "Website",
     "vat_id": "VAT ID",
     "industry_segment": "Industry Segment",
+    "north_data_business_segment": "North Data Business Segment",
+    "claude_business_segment": "Claude Business Segment",
     "wz_code": "WZ Code",
     "business_segment": "Business Segment",
-    "business_segment_claude": "Claude Business Segment",
     "subject": "Business Model",
     "detailed_business_model": "Detailed Business Model",
     "summary": "Detailed Business Model",
@@ -133,6 +133,15 @@ HEADER_RENAMES = {
     "source_name": "Source Name",
     "model_provider": "Model Provider",
     "model_name": "Model Name",
+    "scoring_config": "Scoring Config",
+    "fit_score": "Fit Score",
+    "fit_label": "Fit Label",
+    "fit_comment": "Fit Comment",
+    "succession_signal": "Succession Signal",
+    "financial_signal": "Financial Signal",
+    "shareholder_signal": "Shareholder Signal",
+    "risk_flags": "Risk Flags",
+    "recommended_action": "Recommended Action",
     "api_status": "API Status",
     "notes": "Notes",
     "created_at": "Created At",
@@ -144,14 +153,6 @@ HEADER_RENAMES = {
     "last_updated_at": "Last Updated At",
     "module": "Module",
     "message": "Message",
-    "fit_score": "Fit Score",
-    "fit_label": "Fit Label",
-    "fit_comment": "Fit Comment",
-    "succession_signal": "Succession Signal",
-    "financial_signal": "Financial Signal",
-    "shareholder_signal": "Shareholder Signal",
-    "risk_flags": "Risk Flags",
-    "recommended_action": "Recommended Action",
 }
 
 
@@ -160,7 +161,7 @@ OVERVIEW_HEADERS = [
     "Company Name",
     "Legal Form",
     "WZ Code",
-    "Business Segment",
+    "North Data Business Segment",
     "Claude Business Segment",
     "Business Model",
     "Detailed Business Model",
@@ -325,21 +326,11 @@ def get_latest_model_for_register(company_models, register_id):
     if not matches:
         return {}
 
-    latest = sorted(
+    return sorted(
         matches,
-        key=lambda x: str(x.get("created_at", "")),
+        key=lambda x: str(x.get("updated_at", "") or x.get("created_at", "")),
         reverse=True,
     )[0]
-
-    raw_data = latest.get("raw_data") or {}
-    if isinstance(raw_data, str):
-        try:
-            raw_data = json.loads(raw_data)
-        except Exception:
-            raw_data = {}
-
-    latest["business_segment_claude"] = raw_data.get("business_segment_claude", "")
-    return latest
 
 
 def get_latest_fit_score_for_register(fit_scores, register_id):
@@ -398,24 +389,6 @@ def get_default_news(news_by_register, register_id):
     )[0]
 
 
-def build_shareholder_counts(shareholders_by_register, register_id):
-    rows = shareholders_by_register.get(register_id, [])
-    rows = [row for row in rows if str(row.get("shareholder_name", "")).strip()]
-
-    total = len(rows)
-    natural = 0
-    corporate = 0
-
-    for row in rows:
-        sh_type = str(row.get("shareholder_type", "")).lower()
-        if "natural" in sh_type:
-            natural += 1
-        elif "corporate" in sh_type:
-            corporate += 1
-
-    return total, natural, corporate
-
-
 def build_overview_values(
     companies,
     shareholders,
@@ -447,33 +420,23 @@ def build_overview_values(
         shareholder = get_default_shareholder(shareholders_by_register, register_id)
         news = get_default_news(news_by_register, register_id)
 
-        total_sh, natural_sh, corporate_sh = build_shareholder_counts(
-            shareholders_by_register,
-            register_id,
-        )
-
         next_row_number = len(values) + 1
+
         equity_ratio_formula = f'=IFERROR(M{next_row_number}/L{next_row_number},"")'
 
         company_updated_at = str(company.get("updated_at", ""))
-        model_updated_at = str(model.get("created_at", ""))
-        score_updated_at = str(
-            fit_score.get("updated_at", "") or fit_score.get("created_at", "")
-        )
+        model_updated_at = str(model.get("updated_at", "") or model.get("created_at", ""))
+        score_updated_at = str(fit_score.get("updated_at", "") or fit_score.get("created_at", ""))
 
-        last_updated_at = max(
-            company_updated_at,
-            model_updated_at,
-            score_updated_at,
-        )
+        last_updated_at = max(company_updated_at, model_updated_at, score_updated_at)
 
         row = [
             register_id,
             company.get("name", ""),
             company.get("legal_form", ""),
             company.get("wz_code", ""),
-            company.get("business_segment", ""),
-            model.get("business_segment_claude", ""),
+            company.get("business_segment", ""),  # North Data business segment
+            model.get("business_segment", ""),    # Claude business segment
             company.get("subject", ""),
             model.get("summary", ""),
             company.get("city", ""),
@@ -484,9 +447,15 @@ def build_overview_values(
             equity_ratio_formula,
             company.get("financials_date", ""),
             company.get("employee_number", ""),
-            total_sh,
-            natural_sh,
-            corporate_sh,
+            len(shareholders_by_register.get(register_id, [])),
+            sum(
+                1 for sh in shareholders_by_register.get(register_id, [])
+                if "natural" in str(sh.get("shareholder_type", "")).lower()
+            ),
+            sum(
+                1 for sh in shareholders_by_register.get(register_id, [])
+                if "corporate" in str(sh.get("shareholder_type", "")).lower()
+            ),
             shareholder.get("shareholder_name", ""),
             shareholder.get("age", ""),
             shareholder.get("shareholder_type", ""),
@@ -527,7 +496,7 @@ def build_cockpit_values():
         ["Company Name", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$B:$B),"")'],
         ["Legal Form", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$C:$C),"")'],
         ["WZ Code", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$D:$D),"")'],
-        ["Business Segment", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$E:$E),"")'],
+        ["North Data Business Segment", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$E:$E),"")'],
         ["Claude Business Segment", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$F:$F),"")'],
         ["Business Model", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$G:$G),"")'],
         ["Detailed Business Model", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$H:$H),"")'],
@@ -560,6 +529,11 @@ def build_cockpit_values():
         ["Shareholder Signal", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AI:$AI),"")'],
         ["Risk Flags", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AJ:$AJ),"")'],
         ["Recommended Action", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AK:$AK),"")'],
+        ["Scoring Model", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AL:$AL),"")'],
+        ["Score Updated At", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AM:$AM),"")'],
+        ["Company Updated At", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AN:$AN),"")'],
+        ["Model Updated At", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AO:$AO),"")'],
+        ["Last Updated At", '=IFERROR(XLOOKUP($B$3,Overview!$A:$A,Overview!$AP:$AP),"")'],
     ]
 
 
@@ -657,16 +631,16 @@ def format_cockpit_sheet(worksheet):
             },
         )
         worksheet.format(
+            "A:A",
+            {
+                "textFormat": {"bold": True},
+            },
+        )
+        worksheet.format(
             "A:B",
             {
                 "wrapStrategy": "WRAP",
                 "verticalAlignment": "MIDDLE",
-            },
-        )
-        worksheet.format(
-            "A:A",
-            {
-                "textFormat": {"bold": True},
             },
         )
     except Exception:
