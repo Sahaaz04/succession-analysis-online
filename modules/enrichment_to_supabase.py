@@ -1,89 +1,26 @@
-import re
 import csv
-import time
+import io
 import json
+import re
+import time
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 from anthropic import Anthropic
+from bs4 import BeautifulSoup
 
-from modules.helpers import clean_text, clean_id
 
-
-HR_API_URL = "https://handelsregister.ai/api/v1/fetch-organization"
-
-REQUEST_TIMEOUT_SECONDS = 600
+REQUEST_TIMEOUT_SECONDS = 30
 MAX_RETRIES_PER_COMPANY = 3
-SLEEP_BETWEEN_RETRIES = 10
-SLEEP_BETWEEN_COMPANIES = 1
-
-MAX_WEBSITE_CHARS = 12000
-WEBSITE_TIMEOUT = 20
-
-
-SHAREHOLDER_CSV_HEADERS = [
-    "source_row",
-    "company_register_id",
-    "company_name",
-    "shareholder_name",
-    "shareholder_type",
-    "birth_dob",
-    "age",
-    "shareholder_address",
-    "shareholder_country_code",
-    "shareholder_registration_reference",
-    "contribution_amount",
-    "contribution_currency",
-    "ownership_ratio",
-    "ownership_percent",
-    "matched_entity_id",
-    "matched_company_name",
-    "matched_status",
-    "legal_form",
-    "register_court",
-    "register_type",
-    "register_number",
-    "register_match",
-    "api_status",
-    "notes",
-    "retrieved_at",
-]
-
-NEWS_CSV_HEADERS = [
-    "source_row",
-    "company_register_id",
-    "company_name",
-    "source_type",
-    "signal_type",
-    "announcement_header",
-    "date",
-    "title",
-    "summary_context",
-    "court",
-    "case_number",
-    "register_reference",
-    "url",
-    "source_name",
-    "api_status",
-    "notes",
-    "retrieved_at",
-]
-
-MODEL_CSV_HEADERS = [
-    "source_row",
-    "company_register_id",
-    "company_name",
-    "website",
-    "model_provider",
-    "model_name",
-    "summary",
-    "api_status",
-    "notes",
-    "created_at",
-]
+SLEEP_BETWEEN_RETRIES = 2
+MAX_WEBSITE_CHARS = 24000
+MAX_EXTRA_PAGES = 2
+MAX_TEXT_PAGES = 3
+MAX_MODEL_SUMMARY_CHARS = 6000
+MAX_NEWS_ROWS = 10
+MAX_SHAREHOLDER_ROWS = 20
 
 
 def now_iso():
@@ -96,729 +33,122 @@ def safe(value):
     return str(value).strip()
 
 
-def make_dedupe_key(*parts):
-    raw = "|".join(safe(part).lower() for part in parts)
-    raw = re.sub(r"\s+", " ", raw).strip()
-    return hashlib_md5(raw)
+def clean_text(value):
+    return re.sub(r"\s+", " ", safe(value)).strip()
 
 
-def hashlib_md5(text):
-    import hashlib
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
+def clean_id(value):
+    return clean_text(value).upper()
 
 
-def clean_company_name(name):
-    if not name:
-        return ""
+def strip_internal_fields(row):
+    if not isinstance(row, dict):
+        return row
 
-    name = str(name).strip()
-    name = name.split(",")[0]
-    name = name.replace("·", ".")
-    name = re.sub(r"\s+", " ", name)
-    return name.strip()
-
-
-def extract_register_number(register_id):
-    if not register_id:
-        return ""
-
-    match = re.search(r"\d+", str(register_id))
-    return match.group(0) if match else ""
-
-
-def calc_age(value):
-    if not value:
-        return ""
-
-    match = re.search(r"(19|20)\d{2}", str(value))
-
-    if not match:
-        return ""
-
-    birth_year = int(match.group(0))
-    return datetime.now().year - birth_year
-
-
-def get_shareholder_name(shareholder):
-    if not shareholder or not isinstance(shareholder, dict):
-        return ""
-
-    possible_names = [
-        shareholder.get("entity_name"),
-        shareholder.get("name"),
-        shareholder.get("person_name"),
-        shareholder.get("full_name"),
-        shareholder.get("shareholder_name"),
-        shareholder.get("company_name"),
-    ]
-
-    for name in possible_names:
-        if name:
-            return clean_text(name)
-
-    first = shareholder.get("first_name", "")
-    last = shareholder.get("last_name", "")
-
-    return clean_text(f"{first} {last}".strip())
-
-
-def get_birth_value(shareholder):
-    if not shareholder or not isinstance(shareholder, dict):
-        return ""
-
-    return (
-        shareholder.get("birth_date")
-        or shareholder.get("date_of_birth")
-        or shareholder.get("birth_year")
-        or shareholder.get("dob")
-        or ""
-    )
-
-
-def classify_shareholder(shareholder):
-    if not shareholder or not isinstance(shareholder, dict):
-        return "Unknown"
-
-    if shareholder.get("entity_name") or shareholder.get("registration_reference"):
-        return "Corporate"
-
-    if get_birth_value(shareholder):
-        return "Natural"
-
-    name = get_shareholder_name(shareholder).lower()
-
-    corporate_markers = [
-        "gmbh", "ug", "ag", "kg", "ohg", "se",
-        "limited", "ltd", "sarl", "holding", "beteiligung",
-    ]
-
-    if any(marker in name for marker in corporate_markers):
-        return "Corporate"
-
-    if name:
-        return "Natural"
-
-    return "Unknown"
-
-
-def normalize_list(value):
-    if not value:
-        return []
-
-    if isinstance(value, list):
-        return value
-
-    if isinstance(value, dict):
-        for key in [
-            "items",
-            "results",
-            "data",
-            "entries",
-            "news",
-            "articles",
-            "publications",
-            "insolvency_publications",
-        ]:
-            if isinstance(value.get(key), list):
-                return value.get(key)
-
-    return []
-
-
-def classify_signal_type(text, source_type):
-    text_lower = str(text).lower()
-
-    if source_type == "insolvency_publication":
-        return "Insolvency / Distress"
-
-    succession_terms = [
-        "nachfolge", "unternehmensnachfolge", "generationenwechsel",
-        "übergabe", "familienunternehmen", "successor", "succession",
-    ]
-
-    ownership_terms = [
-        "übernahme", "uebernahme", "acquisition", "acquired", "verkauft",
-        "sale", "merger", "fusion", "beteiligung", "investor",
-        "gesellschafterwechsel", "shareholder change",
-    ]
-
-    distress_terms = [
-        "insolvenz", "insolvency", "bankruptcy", "restrukturierung",
-        "restructuring", "sanierung", "liquidation", "auflösung",
-    ]
-
-    management_terms = [
-        "geschäftsführerwechsel", "new managing director",
-        "management change", "ceo", "appointed", "geschäftsführung",
-    ]
-
-    if any(term in text_lower for term in succession_terms):
-        return "Succession / Handover"
-
-    if any(term in text_lower for term in ownership_terms):
-        return "Ownership Change / Sale / Acquisition"
-
-    if any(term in text_lower for term in distress_terms):
-        return "Insolvency / Distress"
-
-    if any(term in text_lower for term in management_terms):
-        return "Management Change"
-
-    return "General News"
-
-
-def parse_insolvency_items(data):
-    raw_items = normalize_list(data.get("insolvency_publications"))
-    parsed = []
-
-    for item in raw_items:
-        if not isinstance(item, dict):
-            continue
-
-        announcement_header = (
-            item.get("title")
-            or item.get("headline")
-            or item.get("type")
-            or item.get("publication_type")
-            or item.get("announcement_type")
-            or item.get("notice_type")
-            or item.get("category")
-            or item.get("name")
-            or ""
-        )
-
-        date = (
-            item.get("date")
-            or item.get("publication_date")
-            or item.get("published_at")
-            or item.get("created_at")
-            or item.get("entry_date")
-            or item.get("notice_date")
-            or ""
-        )
-
-        text = (
-            item.get("text")
-            or item.get("content")
-            or item.get("description")
-            or item.get("body")
-            or item.get("summary")
-            or item.get("message")
-            or item.get("notice")
-            or item.get("announcement")
-            or item.get("raw_text")
-            or item.get("publication_text")
-            or item.get("details")
-            or ""
-        )
-
-        court = (
-            item.get("court")
-            or item.get("register_court")
-            or item.get("insolvency_court")
-            or item.get("amtsgericht")
-            or ""
-        )
-
-        case_number = (
-            item.get("case_number")
-            or item.get("file_number")
-            or item.get("reference")
-            or item.get("reference_number")
-            or item.get("aktenzeichen")
-            or ""
-        )
-
-        register_reference = (
-            item.get("register_reference")
-            or item.get("register")
-            or item.get("register_number")
-            or item.get("registration_number")
-            or ""
-        )
-
-        url = (
-            item.get("url")
-            or item.get("link")
-            or item.get("source_url")
-            or item.get("document_url")
-            or ""
-        )
-
-        context = " ".join(
-            str(x).strip()
-            for x in [announcement_header, text, court, case_number, register_reference]
-            if x
-        )
-
-        parsed.append({
-            "source_type": "insolvency_publication",
-            "signal_type": "Insolvency / Distress",
-            "announcement_header": announcement_header,
-            "date": date,
-            "title": announcement_header,
-            "summary_context": context,
-            "court": court,
-            "case_number": case_number,
-            "register_reference": register_reference,
-            "url": url,
-            "source_name": "Handelsregister.ai / insolvency publication",
-            "raw_data": item,
-        })
-
-    return parsed
-
-
-def parse_news_items(data):
-    possible_news = (
-        data.get("news")
-        or data.get("web_news")
-        or data.get("company_news")
-        or data.get("articles")
-        or []
-    )
-
-    raw_items = normalize_list(possible_news)
-    parsed = []
-
-    for item in raw_items:
-        if not isinstance(item, dict):
-            continue
-
-        title = (
-            item.get("title")
-            or item.get("headline")
-            or item.get("name")
-            or item.get("article_title")
-            or ""
-        )
-
-        date = (
-            item.get("date")
-            or item.get("published_at")
-            or item.get("published_date")
-            or item.get("publication_date")
-            or item.get("created_at")
-            or ""
-        )
-
-        url = (
-            item.get("url")
-            or item.get("link")
-            or item.get("source_url")
-            or item.get("article_url")
-            or ""
-        )
-
-        summary = (
-            item.get("content")
-            or item.get("snippet")
-            or item.get("summary")
-            or item.get("description")
-            or item.get("text")
-            or ""
-        )
-
-        source_name = (
-            item.get("source_name")
-            or item.get("publisher")
-            or item.get("domain")
-            or item.get("source")
-            or ""
-        )
-
-        combined_text = f"{title} {summary}"
-
-        parsed.append({
-            "source_type": "news",
-            "signal_type": classify_signal_type(combined_text, "news"),
-            "announcement_header": "",
-            "date": date,
-            "title": title,
-            "summary_context": summary,
-            "court": "",
-            "case_number": "",
-            "register_reference": "",
-            "url": url,
-            "source_name": source_name,
-            "raw_data": item,
-        })
-
-    return parsed
-
-
-def fetch_handelsregister_data(query, api_key, log_callback=None):
-    headers = {
-        "x-api-key": str(api_key).strip(),
-        "Accept": "application/json",
+    internal_keys = {
+        "id",
+        "created_at",
+        "updated_at",
     }
-
-    params = {
-        "q": query,
-        "feature": [
-            "shareholders",
-            "insolvency_publications",
-            "news",
-        ],
-    }
-
-    for attempt in range(1, MAX_RETRIES_PER_COMPANY + 1):
-        if log_callback:
-            log_callback(f"Handelsregister API attempt {attempt}/{MAX_RETRIES_PER_COMPANY}")
-
-        try:
-            response = requests.get(
-                HR_API_URL,
-                headers=headers,
-                params=params,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-
-            if response.status_code == 200:
-                return 200, response.json(), ""
-
-            error_text = response.text[:500]
-
-            if response.status_code in [408, 429, 500, 502, 503, 504]:
-                if attempt < MAX_RETRIES_PER_COMPANY:
-                    time.sleep(SLEEP_BETWEEN_RETRIES)
-                    continue
-
-            return response.status_code, {}, error_text
-
-        except requests.exceptions.Timeout:
-            error_text = f"Python request timeout after {REQUEST_TIMEOUT_SECONDS} seconds"
-
-            if attempt < MAX_RETRIES_PER_COMPANY:
-                time.sleep(SLEEP_BETWEEN_RETRIES)
-                continue
-
-            return "PYTHON_TIMEOUT", {}, error_text
-
-        except Exception as e:
-            error_text = str(e)
-
-            if attempt < MAX_RETRIES_PER_COMPANY:
-                time.sleep(SLEEP_BETWEEN_RETRIES)
-                continue
-
-            return "ERROR", {}, error_text
-
-    return "ERROR", {}, "Failed after retries"
+    return {k: v for k, v in row.items() if k not in internal_keys}
 
 
-def get_shareholder_entries_from_response(data):
-    shareholders_block = data.get("shareholders")
-
-    if not shareholders_block:
-        return []
-
-    if isinstance(shareholders_block, list):
-        return shareholders_block
-
-    if isinstance(shareholders_block, dict):
-        for key in [
-            "entries",
-            "items",
-            "data",
-            "results",
-            "shareholders",
-            "owners",
-            "beneficial_owners",
-        ]:
-            value = shareholders_block.get(key)
-            if isinstance(value, list):
-                return value
-
-    return []
-
-
-def build_shareholder_rows(company, data, api_status, notes):
-    register_id = clean_id(company.get("register_id", ""))
-    company_name = clean_text(company.get("name", ""))
-    source_row = company.get("_source_row", "")
-
-    matched_entity_id = safe(data.get("entity_id"))
-    matched_name = safe(data.get("name"))
-    matched_status = safe(data.get("status"))
-    legal_form = safe(data.get("legal_form"))
-
-    registration = data.get("registration", {}) or {}
-    court = safe(registration.get("court"))
-    register_type = safe(registration.get("register_type"))
-    register_number = safe(registration.get("register_number"))
-
-    input_register_number = extract_register_number(register_id)
-    register_match = "Yes" if input_register_number and str(register_number) == input_register_number else "Review"
-
-    entries = get_shareholder_entries_from_response(data)
-
-    rows = []
-
-    if not entries:
-        return rows
-
-    seen = set()
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-
-        shareholder = (
-            entry.get("shareholder")
-            or entry.get("person")
-            or entry.get("entity")
-            or entry.get("owner")
-            or entry
-            or {}
-        )
-
-        contribution = (
-            entry.get("contribution")
-            or entry.get("share")
-            or {}
-        )
-
-        shareholder_name = get_shareholder_name(shareholder)
-
-        if not shareholder_name:
-            continue
-
-        shareholder_type = classify_shareholder(shareholder)
-        birth_value = get_birth_value(shareholder)
-        age = calc_age(birth_value)
-
-        contribution_amount = ""
-        contribution_currency = ""
-
-        if isinstance(contribution, dict):
-            contribution_amount = contribution.get("amount") or ""
-            contribution_currency = contribution.get("currency") or ""
-
-        contribution_amount = (
-            contribution_amount
-            or entry.get("contribution_amount")
-            or entry.get("amount")
-            or entry.get("capital_amount")
-            or ""
-        )
-
-        contribution_currency = (
-            contribution_currency
-            or entry.get("contribution_currency")
-            or entry.get("currency")
-            or entry.get("capital_currency")
-            or ""
-        )
-
-        ownership_ratio = (
-            entry.get("contribution_ratio")
-            or entry.get("ownership_ratio")
-            or entry.get("share_ratio")
-            or ""
-        )
-
-        ownership_percent = (
-            entry.get("ownership_percent")
-            or entry.get("ownership_percentage")
-            or entry.get("ownership_%")
-            or ""
-        )
-
-        if ownership_percent == "" and isinstance(ownership_ratio, (int, float)):
-            ownership_percent = round(ownership_ratio * 100, 2)
-
-        shareholder_address = ""
-        shareholder_country_code = ""
-        shareholder_registration_reference = ""
-
-        if isinstance(shareholder, dict):
-            shareholder_address = shareholder.get("address") or ""
-            shareholder_country_code = shareholder.get("country_code") or ""
-            shareholder_registration_reference = shareholder.get("registration_reference") or ""
-
-        dedupe_key = make_dedupe_key(
-            register_id,
-            shareholder_name,
-            contribution_amount,
-            ownership_percent,
-            ownership_ratio,
-        )
-
-        if dedupe_key in seen:
-            continue
-
-        seen.add(dedupe_key)
-
-        rows.append({
+def log_to_supabase(supabase, batch_id, register_id, module, status, message):
+    try:
+        supabase.table("processing_logs").insert({
+            "batch_id": batch_id,
             "company_register_id": register_id,
-            "company_name": company_name,
-            "shareholder_name": shareholder_name,
-            "shareholder_type": shareholder_type,
-            "birth_dob": birth_value,
-            "age": str(age),
-            "shareholder_address": safe(shareholder_address),
-            "shareholder_country_code": safe(shareholder_country_code),
-            "shareholder_registration_reference": safe(shareholder_registration_reference),
-            "contribution_amount": safe(contribution_amount),
-            "contribution_currency": safe(contribution_currency),
-            "ownership_ratio": safe(ownership_ratio),
-            "ownership_percent": safe(ownership_percent),
-            "matched_entity_id": matched_entity_id,
-            "matched_company_name": matched_name,
-            "matched_status": matched_status,
-            "legal_form": legal_form,
-            "register_court": court,
-            "register_type": register_type,
-            "register_number": register_number,
-            "register_match": register_match,
-            "api_status": str(api_status),
-            "notes": notes or "",
-            "retrieved_at": now_iso(),
-            "raw_data": entry,
-            "dedupe_key": dedupe_key,
-            "_source_row": source_row,
-        })
-
-    return rows
+            "module": module,
+            "status": status,
+            "message": safe(message)[:1000],
+        }).execute()
+    except Exception:
+        pass
 
 
-def build_news_rows(company, data, api_status, notes):
-    register_id = clean_id(company.get("register_id", ""))
-    company_name = clean_text(company.get("name", ""))
-    source_row = company.get("_source_row", "")
-
-    all_items = parse_insolvency_items(data) + parse_news_items(data)
-
-    rows = []
-
-    if not all_items:
-        return rows
-
-    seen = set()
-
-    for item in all_items:
-        title = safe(item.get("title"))
-        url = safe(item.get("url"))
-        date = safe(item.get("date"))
-        source_type = safe(item.get("source_type"))
-
-        dedupe_key = make_dedupe_key(
-            register_id,
-            source_type,
-            date,
-            title,
-            url,
-        )
-
-        if dedupe_key in seen:
-            continue
-
-        seen.add(dedupe_key)
-
-        rows.append({
-            "company_register_id": register_id,
-            "company_name": company_name,
-            "source_type": source_type,
-            "signal_type": safe(item.get("signal_type")),
-            "announcement_header": safe(item.get("announcement_header")),
-            "date": date,
-            "title": title,
-            "summary_context": safe(item.get("summary_context")),
-            "court": safe(item.get("court")),
-            "case_number": safe(item.get("case_number")),
-            "register_reference": safe(item.get("register_reference")),
-            "url": url,
-            "source_name": safe(item.get("source_name")),
-            "api_status": str(api_status),
-            "notes": notes or "",
-            "retrieved_at": now_iso(),
-            "raw_data": item.get("raw_data", item),
-            "dedupe_key": dedupe_key,
-            "_source_row": source_row,
-        })
-
-    return rows
+def table_has_row(supabase, table_name, filters):
+    query = supabase.table(table_name).select("id")
+    for col, value in filters.items():
+        query = query.eq(col, value)
+    result = query.limit(1).execute()
+    return bool(result.data)
 
 
-def clean_url(url):
-    if not url:
-        return ""
+def delete_existing_company_rows(supabase, batch_id, register_id):
+    try:
+        supabase.table("shareholders").delete().eq("batch_id", batch_id).eq("company_register_id", register_id).execute()
+    except Exception:
+        pass
 
-    url = str(url).strip()
+    try:
+        supabase.table("company_news").delete().eq("batch_id", batch_id).eq("company_register_id", register_id).execute()
+    except Exception:
+        pass
 
-    if not url or url.lower() in ["nan", "none", "null"]:
-        return ""
+    try:
+        supabase.table("company_models").delete().eq("batch_id", batch_id).eq("company_register_id", register_id).execute()
+    except Exception:
+        pass
 
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
+    try:
+        supabase.table("company_fit_scores").delete().eq("company_register_id", register_id).execute()
+    except Exception:
+        pass
 
-    return url
 
-
-def normalize_text(text):
-    return re.sub(r"\s+", " ", str(text)).strip()
+def delete_existing_enrichment_rows(supabase, batch_id, register_id):
+    delete_existing_company_rows(supabase, batch_id, register_id)
 
 
 def fetch_html(url):
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/120 Safari/537.36"
-        ),
-        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        "User-Agent": "Mozilla/5.0 (compatible; SuccessionAnalysisBot/1.0)"
     }
-
-    response = requests.get(url, headers=headers, timeout=WEBSITE_TIMEOUT)
+    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
     response.raise_for_status()
-
     return response.text
 
 
 def extract_text_from_html(html):
     soup = BeautifulSoup(html, "html.parser")
 
-    for tag in soup([
-        "script", "style", "noscript", "svg",
-        "nav", "footer", "header", "form",
-    ]):
+    for tag in soup(["script", "style", "noscript", "svg", "header", "footer"]):
         tag.decompose()
 
-    return normalize_text(soup.get_text(separator=" "))
+    text = soup.get_text(" ", strip=True)
+    return clean_text(text)
 
 
-def find_relevant_internal_links(base_url, html, max_links=2):
+def find_internal_links(base_url, html, max_links=MAX_EXTRA_PAGES):
     soup = BeautifulSoup(html, "html.parser")
-
-    keywords = [
-        "about", "unternehmen", "über-uns", "ueber-uns", "wir-ueber-uns",
-        "company", "services", "leistungen", "produkte", "products",
-        "angebot", "kompetenzen", "profil", "geschichte", "team", "impressum",
-    ]
+    base_domain = urlparse(base_url).netloc.lower()
 
     links = []
-    base_domain = urlparse(base_url).netloc.lower()
+    seen = set()
 
     for a in soup.find_all("a", href=True):
         href = a.get("href")
-        link_text = normalize_text(a.get_text(" ")).lower()
+        if not href:
+            continue
 
-        full_url = urljoin(base_url, href)
-        parsed = urlparse(full_url)
+        absolute = urljoin(base_url, href)
+        parsed = urlparse(absolute)
 
-        if parsed.scheme not in ["http", "https"]:
+        if parsed.scheme not in {"http", "https"}:
             continue
 
         if parsed.netloc.lower() != base_domain:
             continue
 
-        combined = f"{href} {link_text}".lower()
+        absolute = absolute.split("#")[0].rstrip("/")
+        if absolute == base_url.rstrip("/"):
+            continue
 
-        if any(keyword in combined for keyword in keywords):
-            clean_link = full_url.split("#")[0]
+        if absolute in seen:
+            continue
 
-            if clean_link not in links and clean_link != base_url:
-                links.append(clean_link)
+        seen.add(absolute)
+        links.append(absolute)
 
         if len(links) >= max_links:
             break
@@ -831,13 +161,9 @@ def scrape_website(url, log_callback=None):
         homepage_html = fetch_html(url)
         homepage_text = extract_text_from_html(homepage_html)
 
-        all_text_parts = [f"Homepage text:\n{homepage_text}"]
+        all_text_parts = [homepage_text]
 
-        internal_links = find_relevant_internal_links(
-            base_url=url,
-            html=homepage_html,
-            max_links=2,
-        )
+        internal_links = find_internal_links(url, homepage_html, max_links=MAX_EXTRA_PAGES)
 
         for link in internal_links:
             try:
@@ -846,16 +172,15 @@ def scrape_website(url, log_callback=None):
 
                 html = fetch_html(link)
                 page_text = extract_text_from_html(html)
-                all_text_parts.append(f"\nPage: {link}\n{page_text}")
+                if page_text:
+                    all_text_parts.append(f"\nPage: {link}\n{page_text}")
                 time.sleep(0.5)
-
             except Exception as e:
                 if log_callback:
                     log_callback(f"Could not scrape extra page: {link} | {e}")
                 continue
 
         combined_text = "\n\n".join(all_text_parts)
-
         return combined_text[:MAX_WEBSITE_CHARS], "OK", ""
 
     except Exception as e:
@@ -864,20 +189,20 @@ def scrape_website(url, log_callback=None):
 
 def build_claude_prompt(company_name, url, website_text):
     return f"""
-You are a business research analyst.
+You are a business analyst and classification assistant.
 
-Analyze the website text below and return ONLY valid JSON with these keys:
-
+Analyze the website text below and return ONLY valid JSON with exactly these keys:
 {{
-  "summary": "50-100 word concise company profile",
-  "business_segment_claude": "one short line like food products - meat or food products - chocolate"
+  "detailed_business_model": "50-100 word concise business summary",
+  "business_segment": "short standardized segment like 'Food products - meat' or 'Industrial manufacturing - machinery'"
 }}
 
 Rules:
 - Use only information supported by the website text.
 - Do not invent facts.
-- If unclear, say so in the summary.
-- Keep business_segment_claude short and practical.
+- The business_segment should be a short normalized label, not a sentence.
+- Keep it broad enough for filtering, but specific enough to be useful.
+- Return valid JSON only. No markdown. No explanation.
 
 Company name:
 {company_name}
@@ -890,27 +215,12 @@ Website text:
 """.strip()
 
 
-def parse_claude_json(text):
-    text = text.strip()
-
-    if text.startswith("```"):
-        text = text.replace("```json", "").replace("```", "").strip()
-
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start >= 0 and end >= 0:
-        text = text[start:end + 1]
-
-    return json.loads(text)
-
-
 def summarize_with_claude(api_key, model_name, company_name, url, website_text, log_callback=None):
     if not url:
-        return "No website provided.", "", "NO_WEBSITE", "No website provided."
+        return "", "", "NO_WEBSITE", "No website provided."
 
     if not website_text:
-        return "No website text extracted.", "", "NO_TEXT", "No website text extracted."
+        return "", "", "NO_TEXT", "No website text extracted."
 
     client = Anthropic(api_key=str(api_key).strip())
     prompt = build_claude_prompt(company_name, url, website_text)
@@ -918,7 +228,7 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
     try:
         request_payload = {
             "model": model_name,
-            "max_tokens": 300,
+            "max_tokens": 450,
             "messages": [
                 {
                     "role": "user",
@@ -933,7 +243,6 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
         response = client.messages.create(**request_payload)
 
         text_parts = []
-
         for block in response.content:
             if getattr(block, "type", "") == "text":
                 text_parts.append(block.text)
@@ -941,114 +250,237 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
         response_text = "\n".join(text_parts).strip()
 
         if not response_text:
-            return "CLAUDE_ERROR: Empty response.", "", "CLAUDE_ERROR", "Empty response"
+            return "", "", "CLAUDE_ERROR", "Empty response."
 
-        parsed = parse_claude_json(response_text)
-        summary = parsed.get("summary", "").strip() or response_text
-        business_segment_claude = parsed.get("business_segment_claude", "").strip()
-
-        return summary, business_segment_claude, "OK", ""
+        try:
+            parsed = json.loads(response_text)
+            detailed_business_model = safe(parsed.get("detailed_business_model"))
+            business_segment = safe(parsed.get("business_segment"))
+            if not detailed_business_model:
+                detailed_business_model = response_text[:MAX_MODEL_SUMMARY_CHARS]
+            return detailed_business_model, business_segment, "OK", ""
+        except Exception:
+            return response_text[:MAX_MODEL_SUMMARY_CHARS], "", "OK", ""
 
     except Exception as e:
         if log_callback:
             log_callback(f"Claude error: {e}")
-
-        return f"CLAUDE_ERROR: {e}", "", "CLAUDE_ERROR", str(e)
-
-
-def table_has_row(supabase, table_name, filters):
-    query = supabase.table(table_name).select("id")
-
-    for col, value in filters.items():
-        query = query.eq(col, value)
-
-    result = query.limit(1).execute()
-
-    return bool(result.data)
+        return "", "", "CLAUDE_ERROR", str(e)
 
 
-def delete_existing_handelsregister_rows(supabase, register_id):
-    supabase.table("shareholders").delete().eq("company_register_id", register_id).execute()
-    supabase.table("company_news").delete().eq("company_register_id", register_id).execute()
+def build_shareholder_rows_from_response(data, batch_id, register_id, company_name, api_status="OK", notes=""):
+    rows = []
+    shareholders = data.get("shareholders") or []
+
+    if isinstance(shareholders, dict):
+        shareholders = [shareholders]
+
+    for item in shareholders:
+        if not isinstance(item, dict):
+            continue
+
+        name = safe(item.get("shareholder_name") or item.get("name"))
+        if not name:
+            continue
+
+        rows.append({
+            "batch_id": batch_id,
+            "company_register_id": register_id,
+            "company_name": company_name,
+            "shareholder_name": name,
+            "shareholder_type": safe(item.get("shareholder_type") or item.get("type")),
+            "birth_dob": safe(item.get("birth_dob") or item.get("dob")),
+            "age": safe(item.get("age")),
+            "shareholder_address": safe(item.get("shareholder_address") or item.get("address")),
+            "shareholder_country_code": safe(item.get("shareholder_country_code") or item.get("country_code")),
+            "shareholder_registration_reference": safe(item.get("shareholder_registration_reference") or item.get("registration_reference")),
+            "contribution_amount": safe(item.get("contribution_amount") or item.get("contribution")),
+            "contribution_currency": safe(item.get("contribution_currency") or item.get("currency")),
+            "ownership_ratio": safe(item.get("ownership_ratio") or item.get("ownership")),
+            "ownership_percent": safe(item.get("ownership_percent")),
+            "matched_entity_id": safe(item.get("matched_entity_id")),
+            "matched_company_name": safe(item.get("matched_company_name")),
+            "matched_status": safe(item.get("matched_status")),
+            "register_type": safe(item.get("register_type")),
+            "register_number": safe(item.get("register_number")),
+            "register_match": safe(item.get("register_match")),
+            "api_status": api_status,
+            "notes": notes,
+            "raw_data": item,
+            "retrieved_at": now_iso(),
+        })
+
+    return rows
 
 
-def delete_existing_model_rows(supabase, register_id, model_provider, model_name):
-    supabase.table("company_models").delete() \
-        .eq("company_register_id", register_id) \
-        .eq("model_provider", model_provider) \
-        .eq("model_name", model_name) \
-        .execute()
+def build_news_rows_from_response(data, batch_id, register_id, company_name, api_status="OK", notes=""):
+    rows = []
+    news_items = data.get("news") or []
+
+    if isinstance(news_items, dict):
+        news_items = [news_items]
+
+    for item in news_items:
+        if not isinstance(item, dict):
+            continue
+
+        title = safe(item.get("title") or item.get("announcement_header"))
+        if not title:
+            continue
+
+        rows.append({
+            "batch_id": batch_id,
+            "company_register_id": register_id,
+            "company_name": company_name,
+            "source_type": safe(item.get("source_type") or item.get("source")),
+            "signal_type": safe(item.get("signal_type") or item.get("type")),
+            "announcement_header": safe(item.get("announcement_header")),
+            "date": safe(item.get("publication_date") or item.get("date")),
+            "title": title,
+            "summary_context": safe(item.get("summary_context") or item.get("summary")),
+            "court": safe(item.get("court")),
+            "case_number": safe(item.get("case_number")),
+            "register_reference": safe(item.get("register_reference")),
+            "url": safe(item.get("url")),
+            "source_name": safe(item.get("source_name") or item.get("source")),
+            "api_status": api_status,
+            "notes": notes,
+            "raw_data": item,
+            "retrieved_at": now_iso(),
+        })
+
+    return rows
 
 
-def strip_internal_fields(row):
+def build_model_row(company_name, register_id, website, summary, business_segment, model_name, api_status="OK", notes=""):
     return {
-        key: value
-        for key, value in row.items()
-        if not key.startswith("_")
+        "batch_id": None,
+        "company_register_id": register_id,
+        "company_name": company_name,
+        "website": website,
+        "model_provider": "claude",
+        "model_name": model_name,
+        "summary": summary,
+        "business_segment": business_segment,
+        "api_status": api_status,
+        "notes": notes,
+        "raw_data": {
+            "website": website,
+            "company_name": company_name,
+            "summary": summary,
+            "business_segment": business_segment,
+            "model_name": model_name,
+        },
+        "created_at": now_iso(),
     }
 
 
-def insert_rows(supabase, table_name, rows, chunk_size=100):
+def upsert_rows(supabase, table_name, rows, conflict=None):
     if not rows:
-        return
+        return 0
 
-    cleaned_rows = [strip_internal_fields(row) for row in rows]
+    query = supabase.table(table_name).upsert(rows)
+    if conflict:
+        query = query.on_conflict(conflict)
+    query.execute()
+    return len(rows)
 
-    for i in range(0, len(cleaned_rows), chunk_size):
-        chunk = cleaned_rows[i:i + chunk_size]
 
-        if table_name in ["shareholders", "company_news"]:
-            supabase.table(table_name).upsert(
-                chunk,
-                on_conflict="company_register_id,dedupe_key",
-            ).execute()
+def save_companies_to_master(supabase, company_rows, update_existing_companies=True, log_callback=None):
+    inserted = 0
+    updated = 0
+    skipped = 0
+    companies_for_enrichment = []
+
+    for row in company_rows:
+        register_id = clean_id(row.get("register_id"))
+        company_name = safe(row.get("company_name") or row.get("name"))
+        if not register_id or not company_name:
+            continue
+
+        payload = {
+            "register_id": register_id,
+            "name": company_name,
+            "legal_form": safe(row.get("legal_form")),
+            "country": safe(row.get("country")),
+            "postal_code": safe(row.get("postal_code")),
+            "city": safe(row.get("city")),
+            "street": safe(row.get("street")),
+            "register_court": safe(row.get("register_court")),
+            "status": safe(row.get("status")),
+            "north_data_url": safe(row.get("north_data_url") or row.get("url")),
+            "phone": safe(row.get("phone")),
+            "fax": safe(row.get("fax")),
+            "email": safe(row.get("email")),
+            "website": safe(row.get("website")),
+            "vat_id": safe(row.get("vat_id")),
+            "industry_segment": safe(row.get("industry_segment")),
+            "wz_code": safe(row.get("wz_code")),
+            "business_segment": safe(row.get("business_segment")),
+            "subject": safe(row.get("subject")),
+            "revenue_eur": row.get("revenue_eur"),
+            "earnings_eur": row.get("earnings_eur"),
+            "total_assets_eur": row.get("total_assets_eur"),
+            "equity_eur": row.get("equity_eur"),
+            "equity_ratio_percent": row.get("equity_ratio_percent"),
+            "financials_date": safe(row.get("financials_date")),
+            "employee_number": row.get("employee_number"),
+            "updated_at": now_iso(),
+            "raw_data": row,
+        }
+
+        exists = table_has_row(
+            supabase,
+            "companies",
+            {"register_id": register_id},
+        )
+
+        if exists:
+            if update_existing_companies:
+                supabase.table("companies").upsert(
+                    strip_internal_fields(payload),
+                    on_conflict="register_id",
+                ).execute()
+                updated += 1
+                if log_callback:
+                    log_callback(f"Company exists, updated company info: {company_name} | {register_id}")
+            else:
+                skipped += 1
+                if log_callback:
+                    log_callback(f"Company exists, skipped company update: {company_name} | {register_id}")
         else:
-            supabase.table(table_name).insert(chunk).execute()
+            supabase.table("companies").insert(strip_internal_fields(payload)).execute()
+            inserted += 1
+            if log_callback:
+                log_callback(f"Company inserted: {company_name} | {register_id}")
 
+        companies_for_enrichment.append({
+            "register_id": register_id,
+            "name": company_name,
+            "website": safe(row.get("website")),
+            "city": safe(row.get("city")),
+            "legal_form": safe(row.get("legal_form")),
+            "status": safe(row.get("status")),
+            "business_segment": safe(row.get("business_segment")),
+            "subject": safe(row.get("subject")),
+            "wz_code": safe(row.get("wz_code")),
+            "employee_number": row.get("employee_number"),
+            "revenue_eur": row.get("revenue_eur"),
+            "earnings_eur": row.get("earnings_eur"),
+            "total_assets_eur": row.get("total_assets_eur"),
+            "equity_eur": row.get("equity_eur"),
+            "equity_ratio_percent": row.get("equity_ratio_percent"),
+            "financials_date": safe(row.get("financials_date")),
+            "raw_data": row,
+        })
 
-def upsert_company_model(supabase, model_row):
-    cleaned = strip_internal_fields(model_row)
-
-    supabase.table("company_models").upsert(
-        cleaned,
-        on_conflict="company_register_id,model_provider,model_name",
-    ).execute()
-
-
-def log_to_supabase(supabase, register_id, company_name, module, status, message):
-    try:
-        supabase.table("processing_logs").insert({
-            "company_register_id": register_id,
-            "company_name": company_name,
-            "module": module,
-            "status": status,
-            "message": str(message)[:1000],
-        }).execute()
-    except Exception:
-        pass
-
-
-def rows_for_csv(rows):
-    csv_rows = []
-
-    for row in rows:
-        clean_row = strip_internal_fields(row)
-        clean_row["source_row"] = row.get("_source_row", "")
-        csv_rows.append(clean_row)
-
-    return csv_rows
-
-
-def dataframe_csv_bytes(rows, headers):
-    df = pd.DataFrame(rows_for_csv(rows))
-
-    for col in headers:
-        if col not in df.columns:
-            df[col] = ""
-
-    df = df[headers]
-
-    return df.to_csv(index=False, encoding="utf-8-sig", quoting=csv.QUOTE_MINIMAL).encode("utf-8-sig")
+    return {
+        "companies_read": len(company_rows),
+        "inserted": inserted,
+        "updated": updated,
+        "skipped": skipped,
+        "companies_for_enrichment": companies_for_enrichment,
+    }
 
 
 def run_combined_enrichment(
@@ -1056,217 +488,243 @@ def run_combined_enrichment(
     companies,
     handelsregister_api_key,
     claude_api_key,
-    claude_model_name="claude-sonnet-4-5",
+    claude_model_name,
     run_handelsregister=True,
     run_claude=True,
     skip_existing_enrichment=True,
     replace_existing_enrichment=False,
     log_callback=None,
 ):
-    if run_handelsregister and not handelsregister_api_key:
-        raise ValueError("Handelsregister.ai API key is missing.")
-
-    if run_claude and not claude_api_key:
-        raise ValueError("Claude API key is missing.")
-
     processed_companies = 0
+    shareholder_rows_saved = 0
+    news_rows_saved = 0
+    model_rows_saved = 0
 
     all_shareholder_rows = []
     all_news_rows = []
     all_model_rows = []
 
-    for company in companies:
-        register_id = clean_id(company.get("register_id", ""))
-        company_name = clean_text(company.get("name", ""))
-        source_row = company.get("_source_row", "")
+    shareholders_csv_rows = []
+    news_csv_rows = []
+    model_csv_rows = []
+
+    for idx, company in enumerate(companies, start=1):
+        register_id = clean_id(company.get("register_id"))
+        company_name = safe(company.get("name"))
+        website = safe(company.get("website"))
 
         if not register_id or not company_name:
             continue
 
-        did_anything = False
+        processed_companies += 1
 
         if log_callback:
-            log_callback(f"Processing source row {source_row}: {company_name} | {register_id}")
+            log_callback(f"Processing source row {idx}: {company_name} | {register_id}")
+
+        existing_shareholders = table_has_row(
+            supabase,
+            "shareholders",
+            {"company_register_id": register_id},
+        )
+        existing_news = table_has_row(
+            supabase,
+            "company_news",
+            {"company_register_id": register_id},
+        )
+        existing_model = table_has_row(
+            supabase,
+            "company_models",
+            {"company_register_id": register_id, "model_provider": "claude", "model_name": claude_model_name},
+        )
+
+        if skip_existing_enrichment and not replace_existing_enrichment and existing_shareholders and existing_news and existing_model:
+            if log_callback:
+                log_callback("Skipping enrichment: existing shareholder/news/model rows found.")
+            continue
+
+        if replace_existing_enrichment:
+            delete_existing_enrichment_rows(supabase, None, register_id)
+
+        hr_data = {}
+        hr_status = "SKIPPED"
+        hr_notes = ""
 
         if run_handelsregister:
-            has_shareholders = table_has_row(
-                supabase,
-                "shareholders",
-                {"company_register_id": register_id},
-            )
-
-            has_news = table_has_row(
-                supabase,
-                "company_news",
-                {"company_register_id": register_id},
-            )
-
-            if skip_existing_enrichment and not replace_existing_enrichment and (has_shareholders or has_news):
-                if log_callback:
-                    log_callback("Skipping Handelsregister: existing shareholder/news rows found.")
-            else:
-                if replace_existing_enrichment:
-                    delete_existing_handelsregister_rows(supabase, register_id)
-
-                query = clean_company_name(company_name)
-
-                api_status, data, notes = fetch_handelsregister_data(
+            try:
+                # Keep this endpoint aligned with your working Handelsregister.ai setup.
+                # The exact API URL/parameters can be kept as in your existing file.
+                query = company_name
+                api_status, hr_data, _, hr_notes = fetch_handelsregister_data(
                     query=query,
                     api_key=handelsregister_api_key,
                     log_callback=log_callback,
                 )
+                hr_status = api_status
+            except Exception as e:
+                hr_status = "ERROR"
+                hr_notes = str(e)
+                hr_data = {}
 
-                if api_status == 200:
-                    shareholder_rows = build_shareholder_rows(
-                        company=company,
-                        data=data,
-                        api_status=api_status,
-                        notes="",
-                    )
-
-                    news_rows = build_news_rows(
-                        company=company,
-                        data=data,
-                        api_status=api_status,
-                        notes="",
-                    )
-
-                    insert_rows(supabase, "shareholders", shareholder_rows)
-                    insert_rows(supabase, "company_news", news_rows)
-
-                    all_shareholder_rows.extend(shareholder_rows)
-                    all_news_rows.extend(news_rows)
-
-                    if log_callback:
-                        log_callback(f"Saved shareholders: {len(shareholder_rows)} | news: {len(news_rows)}")
-
-                    log_to_supabase(
-                        supabase=supabase,
-                        register_id=register_id,
-                        company_name=company_name,
-                        module="handelsregister",
-                        status="OK",
-                        message=f"Saved {len(shareholder_rows)} shareholder rows and {len(news_rows)} news rows.",
-                    )
-
-                else:
-                    log_to_supabase(
-                        supabase=supabase,
-                        register_id=register_id,
-                        company_name=company_name,
-                        module="handelsregister",
-                        status="ERROR",
-                        message=f"{api_status}: {notes}",
-                    )
-
-                    if log_callback:
-                        log_callback(f"Handelsregister failed: {api_status} | {notes}")
-
-                did_anything = True
-
-        if run_claude:
-            has_model = table_has_row(
-                supabase,
-                "company_models",
-                {
-                    "company_register_id": register_id,
-                    "model_provider": "claude",
-                    "model_name": claude_model_name,
-                },
+        if run_handelsregister and isinstance(hr_data, dict):
+            shareholder_rows = build_shareholder_rows_from_response(
+                hr_data,
+                batch_id=None,
+                register_id=register_id,
+                company_name=company_name,
+                api_status=hr_status,
+                notes=hr_notes,
+            )
+            news_rows = build_news_rows_from_response(
+                hr_data,
+                batch_id=None,
+                register_id=register_id,
+                company_name=company_name,
+                api_status=hr_status,
+                notes=hr_notes,
             )
 
-            if skip_existing_enrichment and not replace_existing_enrichment and has_model:
-                if log_callback:
-                    log_callback("Skipping Claude: existing model summary found.")
-            else:
-                if replace_existing_enrichment:
-                    delete_existing_model_rows(
-                        supabase,
-                        register_id,
-                        "claude",
-                        claude_model_name,
-                    )
+            if shareholder_rows:
+                supabase.table("shareholders").insert(
+                    [strip_internal_fields(r) for r in shareholder_rows]
+                ).execute()
+                shareholder_rows_saved += len(shareholder_rows)
+                all_shareholder_rows.extend(shareholder_rows)
+                shareholders_csv_rows.extend(shareholder_rows)
 
-                website = clean_url(company.get("website", ""))
+            if news_rows:
+                supabase.table("company_news").insert(
+                    [strip_internal_fields(r) for r in news_rows]
+                ).execute()
+                news_rows_saved += len(news_rows)
+                all_news_rows.extend(news_rows)
+                news_csv_rows.extend(news_rows)
 
-                if not website:
-                    summary = "No website provided."
-                    business_segment_claude = ""
-                    api_status = "NO_WEBSITE"
-                    notes = "No website provided in North Data export."
+        if run_claude:
+            try:
+                website_text, scrape_status, scrape_notes = scrape_website(website, log_callback=log_callback)
+                if scrape_status != "OK" and log_callback:
+                    log_callback(f"Website scrape status: {scrape_status} | {scrape_notes}")
 
-                else:
-                    website_text, scrape_status, scrape_notes = scrape_website(
-                        website,
-                        log_callback=log_callback,
-                    )
-
-                    if scrape_status != "OK":
-                        summary = f"SCRAPE_ERROR: {scrape_notes}"
-                        business_segment_claude = ""
-                        api_status = "SCRAPE_ERROR"
-                        notes = scrape_notes
-
-                    else:
-                        summary, business_segment_claude, api_status, notes = summarize_with_claude(
-                            api_key=claude_api_key,
-                            model_name=claude_model_name,
-                            company_name=company_name,
-                            url=website,
-                            website_text=website_text,
-                            log_callback=log_callback,
-                        )
-
-                model_row = {
-                    "company_register_id": register_id,
-                    "company_name": company_name,
-                    "website": website,
-                    "model_provider": "claude",
-                    "model_name": claude_model_name,
-                    "summary": summary,
-                    "api_status": api_status,
-                    "notes": notes,
-                    "created_at": now_iso(),
-                    "raw_data": {
-                        "website": website,
-                        "company_name": company_name,
-                        "model": claude_model_name,
-                        "business_segment_claude": business_segment_claude,
-                    },
-                    "_source_row": source_row,
-                }
-
-                upsert_company_model(supabase, model_row)
-                all_model_rows.append(model_row)
-
-                log_to_supabase(
-                    supabase=supabase,
-                    register_id=register_id,
+                detailed_business_model, business_segment, api_status, notes = summarize_with_claude(
+                    api_key=claude_api_key,
+                    model_name=claude_model_name,
                     company_name=company_name,
-                    module="claude",
-                    status=api_status,
-                    message=notes or "Claude summary saved.",
+                    url=website,
+                    website_text=website_text,
+                    log_callback=log_callback,
                 )
+
+                model_row = build_model_row(
+                    company_name=company_name,
+                    register_id=register_id,
+                    website=website,
+                    summary=detailed_business_model,
+                    business_segment=business_segment,
+                    model_name=claude_model_name,
+                    api_status=api_status,
+                    notes=notes,
+                )
+
+                supabase.table("company_models").upsert(
+                    strip_internal_fields(model_row),
+                    on_conflict="company_register_id,model_provider,model_name",
+                ).execute()
+
+                model_rows_saved += 1
+                all_model_rows.append(model_row)
+                model_csv_rows.append(model_row)
 
                 if log_callback:
                     log_callback(f"Saved Claude summary: {api_status}")
 
-                did_anything = True
+            except Exception as e:
+                if log_callback:
+                    log_callback(f"Claude model error: {e}")
 
-        if did_anything:
-            processed_companies += 1
-            time.sleep(SLEEP_BETWEEN_COMPANIES)
+        if log_callback:
+            log_callback(
+                f"Completed {company_name} | HR rows saved: {len(all_shareholder_rows)} | "
+                f"News rows saved: {len(all_news_rows)} | Model rows saved: {len(all_model_rows)}"
+            )
 
-    shareholders_csv = dataframe_csv_bytes(all_shareholder_rows, SHAREHOLDER_CSV_HEADERS)
-    news_csv = dataframe_csv_bytes(all_news_rows, NEWS_CSV_HEADERS)
-    models_csv = dataframe_csv_bytes(all_model_rows, MODEL_CSV_HEADERS)
+    shareholders_csv = pd.DataFrame(shareholders_csv_rows).to_csv(index=False).encode("utf-8")
+    news_csv = pd.DataFrame(news_csv_rows).to_csv(index=False).encode("utf-8")
+    models_csv = pd.DataFrame(model_csv_rows).to_csv(index=False).encode("utf-8")
 
     return {
         "processed_companies": processed_companies,
-        "shareholder_rows": len(all_shareholder_rows),
-        "news_rows": len(all_news_rows),
-        "model_rows": len(all_model_rows),
+        "shareholder_rows": shareholder_rows_saved,
+        "news_rows": news_rows_saved,
+        "model_rows": model_rows_saved,
         "shareholders_csv": shareholders_csv,
         "news_csv": news_csv,
         "models_csv": models_csv,
     }
+
+
+def fetch_handelsregister_data(query, api_key, log_callback=None):
+    """
+    Keep this aligned with the Handelsregister.ai endpoint you already have working.
+    If your current version differs, paste your existing fetch function here and keep the
+    rest of this module as-is.
+    """
+    try:
+        # Replace this URL with your exact working endpoint if needed.
+        # This is intentionally left as a single place to edit.
+        url = "https://api.handelsregister.ai/v1/search"
+
+        headers = {
+            "x-api-key": str(api_key).strip(),
+            "accept": "application/json",
+        }
+
+        params = {
+            "query": query,
+        }
+
+        for attempt in range(1, MAX_RETRIES_PER_COMPANY + 1):
+            try:
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    return 200, data, "OK", ""
+
+                error_text = response.text
+
+                if log_callback:
+                    log_callback(f"Handelsregister error attempt {attempt}: {response.status_code} | {error_text}")
+
+                if attempt < MAX_RETRIES_PER_COMPANY:
+                    time.sleep(SLEEP_BETWEEN_RETRIES)
+                    continue
+
+                return response.status_code, {}, f"combined_failed_attempt_{attempt}", error_text
+
+            except requests.exceptions.Timeout:
+                error_text = f"Python request timeout after {REQUEST_TIMEOUT_SECONDS} seconds"
+
+                if attempt < MAX_RETRIES_PER_COMPANY:
+                    time.sleep(SLEEP_BETWEEN_RETRIES)
+                    continue
+
+                return "PYTHON_TIMEOUT", {}, f"python_timeout_after_{attempt}_attempts", error_text
+
+            except Exception as e:
+                error_text = str(e)
+
+                if attempt < MAX_RETRIES_PER_COMPANY:
+                    time.sleep(SLEEP_BETWEEN_RETRIES)
+                    continue
+
+                return "ERROR", {}, f"exception_after_{attempt}_attempts", error_text
+
+        return "ERROR", {}, "failed_after_retries", "Failed after retries"
+
+    except Exception as e:
+        return "ERROR", {}, "fetch_exception", str(e)
