@@ -89,8 +89,12 @@ def delete_existing_company_rows(supabase, batch_id, register_id):
     except Exception:
         pass
 
+    # Fix: Isolated company_models deletion to bypass the batch_id constraint check
     try:
-        delete_from("company_models")
+        supabase.table("company_models") \
+            .delete() \
+            .eq("company_register_id", register_id) \
+            .execute()
     except Exception:
         pass
 
@@ -218,6 +222,7 @@ Website text:
 {website_text}
 """.strip()
 
+
 def parse_claude_model_response(response_text):
     text = safe(response_text).strip()
 
@@ -225,7 +230,8 @@ def parse_claude_model_response(response_text):
         return "", "", "CLAUDE_ERROR", "Empty response."
 
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE | re.MULTILINE)
-    text = re.sub(r"\s*```$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
+    text = re.sub(r"\s*
+```$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
 
     candidates = [text]
 
@@ -265,6 +271,7 @@ def parse_claude_model_response(response_text):
         detailed_business_model = text[:MAX_MODEL_SUMMARY_CHARS]
 
     return detailed_business_model, business_segment, "OK", ""
+
 
 def summarize_with_claude(api_key, model_name, company_name, url, website_text, log_callback=None):
     if not url:
@@ -397,11 +404,11 @@ def build_news_rows_from_response(data, batch_id, register_id, company_name, api
     return rows
 
 
+# Fix: Removed "batch_id": None so company_models schemas with no batch_id column do not crash
 def build_model_row(company_name, register_id, website, summary, business_segment, model_name, api_status="OK", notes=""):
     timestamp = now_iso()
 
     return {
-        "batch_id": None,
         "company_register_id": register_id,
         "company_name": company_name,
         "website": website,
@@ -421,6 +428,7 @@ def build_model_row(company_name, register_id, website, summary, business_segmen
             "model_name": model_name,
         },
     }
+
 
 def upsert_rows(supabase, table_name, rows, conflict=None):
     if not rows:
@@ -598,8 +606,6 @@ def run_combined_enrichment(
 
         if run_handelsregister:
             try:
-                # Keep this endpoint aligned with your working Handelsregister.ai setup.
-                # The exact API URL/parameters can be kept as in your existing file.
                 query = company_name
                 api_status, hr_data, _, hr_notes = fetch_handelsregister_data(
                     query=query,
@@ -710,14 +716,7 @@ def run_combined_enrichment(
 
 
 def fetch_handelsregister_data(query, api_key, log_callback=None):
-    """
-    Keep this aligned with the Handelsregister.ai endpoint you already have working.
-    If your current version differs, paste your existing fetch function here and keep the
-    rest of this module as-is.
-    """
     try:
-        # Replace this URL with your exact working endpoint if needed.
-        # This is intentionally left as a single place to edit.
         url = "https://api.handelsregister.ai/v1/search"
 
         headers = {
