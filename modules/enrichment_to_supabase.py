@@ -47,8 +47,6 @@ def strip_internal_fields(row):
 
     internal_keys = {
         "id",
-        "created_at",
-        "updated_at",
     }
     return {k: v for k, v in row.items() if k not in internal_keys}
 
@@ -75,18 +73,24 @@ def table_has_row(supabase, table_name, filters):
 
 
 def delete_existing_company_rows(supabase, batch_id, register_id):
+    def delete_from(table_name):
+        query = supabase.table(table_name).delete().eq("company_register_id", register_id)
+        if batch_id is not None:
+            query = query.eq("batch_id", batch_id)
+        query.execute()
+
     try:
-        supabase.table("shareholders").delete().eq("batch_id", batch_id).eq("company_register_id", register_id).execute()
+        delete_from("shareholders")
     except Exception:
         pass
 
     try:
-        supabase.table("company_news").delete().eq("batch_id", batch_id).eq("company_register_id", register_id).execute()
+        delete_from("company_news")
     except Exception:
         pass
 
     try:
-        supabase.table("company_models").delete().eq("batch_id", batch_id).eq("company_register_id", register_id).execute()
+        delete_from("company_models")
     except Exception:
         pass
 
@@ -214,6 +218,53 @@ Website text:
 {website_text}
 """.strip()
 
+def parse_claude_model_response(response_text):
+    text = safe(response_text).strip()
+
+    if not text:
+        return "", "", "CLAUDE_ERROR", "Empty response."
+
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"\s*```$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
+
+    candidates = [text]
+
+    json_match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if json_match:
+        candidates.append(json_match.group(0))
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                detailed_business_model = safe(parsed.get("detailed_business_model"))
+                business_segment = safe(parsed.get("business_segment"))
+
+                if detailed_business_model or business_segment:
+                    if not detailed_business_model:
+                        detailed_business_model = text[:MAX_MODEL_SUMMARY_CHARS]
+                    return detailed_business_model, business_segment, "OK", ""
+        except Exception:
+            pass
+
+    def extract_field(field_name):
+        pattern = rf'"?{field_name}"?\s*:\s*"((?:\\.|[^"\\])*)"'
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return ""
+        raw_value = match.group(1)
+        try:
+            return bytes(raw_value, "utf-8").decode("unicode_escape")
+        except Exception:
+            return raw_value
+
+    detailed_business_model = extract_field("detailed_business_model")
+    business_segment = extract_field("business_segment")
+
+    if not detailed_business_model:
+        detailed_business_model = text[:MAX_MODEL_SUMMARY_CHARS]
+
+    return detailed_business_model, business_segment, "OK", ""
 
 def summarize_with_claude(api_key, model_name, company_name, url, website_text, log_callback=None):
     if not url:
@@ -252,15 +303,9 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
         if not response_text:
             return "", "", "CLAUDE_ERROR", "Empty response."
 
-        try:
-            parsed = json.loads(response_text)
-            detailed_business_model = safe(parsed.get("detailed_business_model"))
-            business_segment = safe(parsed.get("business_segment"))
-            if not detailed_business_model:
-                detailed_business_model = response_text[:MAX_MODEL_SUMMARY_CHARS]
-            return detailed_business_model, business_segment, "OK", ""
-        except Exception:
-            return response_text[:MAX_MODEL_SUMMARY_CHARS], "", "OK", ""
+        detailed_business_model, business_segment, api_status, notes = parse_claude_model_response(response_text)
+
+        return detailed_business_model, business_segment, api_status, notes
 
     except Exception as e:
         if log_callback:
@@ -353,6 +398,8 @@ def build_news_rows_from_response(data, batch_id, register_id, company_name, api
 
 
 def build_model_row(company_name, register_id, website, summary, business_segment, model_name, api_status="OK", notes=""):
+    timestamp = now_iso()
+
     return {
         "batch_id": None,
         "company_register_id": register_id,
@@ -364,6 +411,8 @@ def build_model_row(company_name, register_id, website, summary, business_segmen
         "business_segment": business_segment,
         "api_status": api_status,
         "notes": notes,
+        "updated_at": timestamp,
+        "created_at": timestamp,
         "raw_data": {
             "website": website,
             "company_name": company_name,
@@ -371,9 +420,7 @@ def build_model_row(company_name, register_id, website, summary, business_segmen
             "business_segment": business_segment,
             "model_name": model_name,
         },
-        "created_at": now_iso(),
     }
-
 
 def upsert_rows(supabase, table_name, rows, conflict=None):
     if not rows:
@@ -534,7 +581,7 @@ def run_combined_enrichment(
         existing_model = table_has_row(
             supabase,
             "company_models",
-            {"company_register_id": register_id, "model_provider": "claude", "model_name": claude_model_name},
+            {"company_register_id": register_id, "model_provider": "claude"},
         )
 
         if skip_existing_enrichment and not replace_existing_enrichment and existing_shareholders and existing_news and existing_model:
@@ -627,7 +674,7 @@ def run_combined_enrichment(
 
                 supabase.table("company_models").upsert(
                     strip_internal_fields(model_row),
-                    on_conflict="company_register_id,model_provider,model_name",
+                    on_conflict="company_register_id,model_provider",
                 ).execute()
 
                 model_rows_saved += 1
