@@ -1,4 +1,4 @@
-import csv
+import csv 
 import io
 import json
 import re
@@ -89,7 +89,7 @@ def delete_existing_company_rows(supabase, batch_id, register_id):
     except Exception:
         pass
 
-    # Fix: Isolated company_models deletion to bypass the batch_id constraint check
+    # FIX: company_models has no batch_id column — delete by register_id only
     try:
         supabase.table("company_models") \
             .delete() \
@@ -229,9 +229,8 @@ def parse_claude_model_response(response_text):
     if not text:
         return "", "", "CLAUDE_ERROR", "Empty response."
 
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE | re.MULTILINE)
-    text = re.sub(r"\s*
-```$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
+    text = re.sub(r"^(?:json)?\s*", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"\s*```$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
 
     candidates = [text]
 
@@ -404,8 +403,17 @@ def build_news_rows_from_response(data, batch_id, register_id, company_name, api
     return rows
 
 
-# Fix: Removed "batch_id": None so company_models schemas with no batch_id column do not crash
-def build_model_row(company_name, register_id, website, summary, business_segment, model_name, api_status="OK", notes=""):
+# FIX: removed "batch_id": None — company_models table has no batch_id column
+def build_model_row(
+    company_name,
+    register_id,
+    website,
+    summary,
+    business_segment,
+    model_name,
+    api_status="OK",
+    notes=""
+):
     timestamp = now_iso()
 
     return {
@@ -716,6 +724,11 @@ def run_combined_enrichment(
 
 
 def fetch_handelsregister_data(query, api_key, log_callback=None):
+    """
+    Keep this aligned with the Handelsregister.ai endpoint you already have working.
+    If your current version differs, paste your existing fetch function here and keep the
+    rest of this module as-is.
+    """
     try:
         url = "https://api.handelsregister.ai/v1/search"
 
