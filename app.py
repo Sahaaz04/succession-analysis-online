@@ -514,7 +514,8 @@ st.divider()
 st.subheader("Filtered Database Export")
 
 st.caption(
-    "Create a filtered CSV from the whole database using master_overview."
+    "Create a filtered workbook from the whole database using master_overview. "
+    "The download keeps the same sheet structure as the main workbook."
 )
 
 with st.form("filtered_export_form"):
@@ -566,10 +567,17 @@ with st.form("filtered_export_form"):
             "value2": v2,
         }
 
-    generate_export = st.form_submit_button("Generate filtered CSV")
+    generate_export = st.form_submit_button("Generate filtered workbook")
 
 if generate_export:
     try:
+        export_log_box = st.empty()
+        export_logs = []
+
+        def export_log(message):
+            export_logs.append(str(message))
+            export_log_box.text("\n".join(export_logs[-40:]))
+
         supabase = get_supabase_client()
         rows = fetch_all_rows_paginated(supabase, "master_overview")
         df = pd.DataFrame(rows)
@@ -589,26 +597,56 @@ if generate_export:
                 operator = spec["operator"]
                 value1 = spec["value1"]
                 value2 = spec["value2"]
+
                 if operator == "Ignore":
                     continue
 
                 if col_key in df.columns:
                     df = apply_numeric_filter(df, col_key, operator, value1, value2)
 
-            df = df.sort_values(by=[c for c in ["company_name", "register_id"] if c in df.columns])
+            if df.empty:
+                st.warning("No companies matched the selected filters.")
+            else:
+                sort_cols = [c for c in ["company_name", "register_id"] if c in df.columns]
+                if sort_cols:
+                    df = df.sort_values(by=sort_cols)
 
-            df = pretty_export_dataframe(df)
+                if "register_id" not in df.columns:
+                    raise KeyError("master_overview does not contain register_id.")
 
-            csv_bytes = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                register_ids = [
+                    str(v).strip()
+                    for v in df["register_id"].dropna().astype(str).tolist()
+                    if str(v).strip()
+                ]
+                register_ids = list(dict.fromkeys(register_ids))
 
-            st.success(f"Filtered rows: {len(df)}")
-            st.download_button(
-                "Download filtered CSV",
-                data=csv_bytes,
-                file_name="filtered_database_export.csv",
-                mime="text/csv",
-                key="download_filtered_export",
-            )
+                if not register_ids:
+                    st.warning("No register IDs were found after filtering.")
+                else:
+                    export_result = build_filtered_workbook_bytes(
+                        supabase=supabase,
+                        register_ids=register_ids,
+                        log_callback=export_log,
+                    )
+
+                    st.success(f"Filtered workbook created for {len(register_ids)} companies.")
+                    st.write("Rows per sheet:")
+                    st.json(export_result["table_counts"])
+
+                    st.download_button(
+                        "Download filtered workbook",
+                        data=export_result["workbook_bytes"],
+                        file_name="filtered_master_workbook.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_filtered_workbook",
+                    )
+
+                    st.caption(
+                        "If you upload this file into Google Sheets, run the existing Apps Script once "
+                        "to reapply the dropdown behavior in Cockpit and Overview."
+                    )
+
     except Exception as e:
         st.error("Filtered export failed.")
         st.exception(e)
