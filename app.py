@@ -6,6 +6,7 @@ import tempfile
 import pandas as pd
 import streamlit as st
 
+from modules.filtered_workbook_export import build_filtered_workbook_bytes
 from modules.supabase_client import get_supabase_client
 from modules.northdata_to_supabase import (
     read_northdata_companies,
