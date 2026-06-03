@@ -40,23 +40,6 @@ def clean_text(value):
 def clean_id(value):
     return clean_text(value).upper()
 
-def build_handelsregister_query_candidates(company):
-    company_name = clean_text(company.get("name"))
-    register_id = clean_text(company.get("register_id"))
-    register_court = clean_text(company.get("register_court"))
-    city = clean_text(company.get("city"))
-
-    candidates = []
-
-    q1 = " ".join(part for part in [company_name, register_court, city] if part)
-    q2 = " ".join(part for part in [register_id, register_court, city] if part)
-
-    for q in [q1, q2]:
-        q = clean_text(q)
-        if q and q not in candidates:
-            candidates.append(q)
-
-    return candidates
 
 def strip_internal_fields(row):
     if not isinstance(row, dict):
@@ -631,10 +614,9 @@ def run_combined_enrichment(
 
         if run_handelsregister:
             try:
-                query_candidates = build_handelsregister_query_candidates(company)
-                
+                query = company_name
                 api_status, hr_data, _, hr_notes = fetch_handelsregister_data(
-                    query_candidates=query_candidates,
+                    query=query,
                     api_key=handelsregister_api_key,
                     log_callback=log_callback,
                 )
@@ -741,28 +723,23 @@ def run_combined_enrichment(
     }
 
 
-def fetch_handelsregister_data(query_candidates, api_key, log_callback=None):
-    if isinstance(query_candidates, str):
-        query_candidates = [query_candidates]
+def fetch_handelsregister_data(query, api_key, log_callback=None):
+    """
+    Keep this aligned with the Handelsregister.ai endpoint you already have working.
+    If your current version differs, paste your existing fetch function here and keep the
+    rest of this module as-is.
+    """
+    try:
+        url = "https://api.handelsregister.ai/v1/search"
 
-    url = "https://api.handelsregister.ai/v1/search"
+        headers = {
+            "x-api-key": str(api_key).strip(),
+            "accept": "application/json",
+        }
 
-    headers = {
-        "x-api-key": str(api_key).strip(),
-        "accept": "application/json",
-    }
-
-    last_error_status = "ERROR"
-    last_error_text = "No query candidates tried."
-
-    for query in query_candidates:
-        if not query:
-            continue
-
-        if log_callback:
-            log_callback(f"Trying Handelsregister query: {query}")
-
-        params = {"query": query}
+        params = {
+            "query": query,
+        }
 
         for attempt in range(1, MAX_RETRIES_PER_COMPANY + 1):
             try:
@@ -774,64 +751,39 @@ def fetch_handelsregister_data(query_candidates, api_key, log_callback=None):
                 )
 
                 if response.status_code == 200:
-                    try:
-                        data = response.json()
-                    except Exception:
-                        last_error_status = "INVALID_JSON"
-                        last_error_text = "Handelsregister returned non-JSON response."
-                        break
-
-                    if data:
-                        return 200, data, "OK", ""
-
-                    last_error_status = "EMPTY_RESULT"
-                    last_error_text = "Handelsregister returned empty JSON."
-                    break
+                    data = response.json()
+                    return 200, data, "OK", ""
 
                 error_text = response.text
 
                 if log_callback:
-                    log_callback(
-                        f"Handelsregister error attempt {attempt}: {response.status_code} | {error_text}"
-                    )
-
-                last_error_status = response.status_code
-                last_error_text = error_text
+                    log_callback(f"Handelsregister error attempt {attempt}: {response.status_code} | {error_text}")
 
                 if attempt < MAX_RETRIES_PER_COMPANY:
                     time.sleep(SLEEP_BETWEEN_RETRIES)
                     continue
 
-                break
+                return response.status_code, {}, f"combined_failed_attempt_{attempt}", error_text
 
             except requests.exceptions.Timeout:
                 error_text = f"Python request timeout after {REQUEST_TIMEOUT_SECONDS} seconds"
 
-                if log_callback:
-                    log_callback(f"Handelsregister timeout attempt {attempt}: {error_text}")
-
-                last_error_status = "PYTHON_TIMEOUT"
-                last_error_text = error_text
-
                 if attempt < MAX_RETRIES_PER_COMPANY:
                     time.sleep(SLEEP_BETWEEN_RETRIES)
                     continue
 
-                break
+                return "PYTHON_TIMEOUT", {}, f"python_timeout_after_{attempt}_attempts", error_text
 
             except Exception as e:
                 error_text = str(e)
 
-                if log_callback:
-                    log_callback(f"Handelsregister exception attempt {attempt}: {error_text}")
-
-                last_error_status = "ERROR"
-                last_error_text = error_text
-
                 if attempt < MAX_RETRIES_PER_COMPANY:
                     time.sleep(SLEEP_BETWEEN_RETRIES)
                     continue
 
-                break
+                return "ERROR", {}, f"exception_after_{attempt}_attempts", error_text
 
-    return last_error_status, {}, "failed_after_retries", last_error_text
+        return "ERROR", {}, "failed_after_retries", "Failed after retries"
+
+    except Exception as e:
+        return "ERROR", {}, "fetch_exception", str(e)
