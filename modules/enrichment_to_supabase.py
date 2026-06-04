@@ -1,8 +1,9 @@
-import csv 
+import csv
 import io
 import json
 import re
 import time
+import unicodedata  # FIX 1: added for accent normalization
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
@@ -49,6 +50,24 @@ def strip_internal_fields(row):
         "id",
     }
     return {k: v for k, v in row.items() if k not in internal_keys}
+
+
+# FIX 2: normalize accented characters to ASCII equivalents
+# é → e, ü → u, ö → o, ä → a, München → Munchen etc.
+# This prevents Cloudflare WAF from flagging encoded non-ASCII chars (%C3%A9 etc.)
+def normalize_to_ascii(text):
+    normalized = unicodedata.normalize("NFKD", safe(text))
+    return normalized.encode("ascii", "ignore").decode("ascii").strip()
+
+
+# FIX 3: build search query with normalized name + optional city
+# Appending city avoids false matches when multiple companies share the same name
+def build_search_query(company_name, city=""):
+    normalized_name = normalize_to_ascii(company_name)
+    if city:
+        normalized_city = normalize_to_ascii(city)
+        return f"{normalized_name} {normalized_city}".strip()
+    return normalized_name
 
 
 def log_to_supabase(supabase, batch_id, register_id, module, status, message):
@@ -575,6 +594,7 @@ def run_combined_enrichment(
         register_id = clean_id(company.get("register_id"))
         company_name = safe(company.get("name"))
         website = safe(company.get("website"))
+        city = safe(company.get("city"))  # FIX 4: grab city for disambiguation
 
         if not register_id or not company_name:
             continue
@@ -614,7 +634,13 @@ def run_combined_enrichment(
 
         if run_handelsregister:
             try:
-                query = company_name
+                # FIX 5: normalize accents + append city to avoid WAF block and
+                # disambiguate companies with identical names in different cities
+                query = build_search_query(company_name, city)
+
+                if log_callback:
+                    log_callback(f"Handelsregister query: '{query}' (original: '{company_name}')")
+
                 api_status, hr_data, _, hr_notes = fetch_handelsregister_data(
                     query=query,
                     api_key=handelsregister_api_key,
@@ -724,11 +750,6 @@ def run_combined_enrichment(
 
 
 def fetch_handelsregister_data(query, api_key, log_callback=None):
-    """
-    Keep this aligned with the Handelsregister.ai endpoint you already have working.
-    If your current version differs, paste your existing fetch function here and keep the
-    rest of this module as-is.
-    """
     try:
         url = "https://api.handelsregister.ai/v1/search"
 
@@ -754,10 +775,33 @@ def fetch_handelsregister_data(query, api_key, log_callback=None):
                     data = response.json()
                     return 200, data, "OK", ""
 
+                # FIX 6: detect Cloudflare managed challenge (the "Just a moment..." page)
+                # Retrying a JS challenge from Python is pointless — bail out immediately
+                if response.status_code == 403:
+                    body = response.text
+                    is_cf_challenge = (
+                        "Just a moment" in body
+                        or "challenges.cloudflare.com" in body
+                        or "cf_chl_opt" in body
+                        or "Enable JavaScript and cookies" in body
+                    )
+                    if is_cf_challenge:
+                        if log_callback:
+                            log_callback(
+                                f"Cloudflare managed challenge detected for query '{query}'. "
+                                "This cannot be solved by a Python HTTP client. "
+                                "Check your API key, or contact Handelsregister support."
+                            )
+                        return "CLOUDFLARE_CHALLENGE", {}, "cloudflare_challenge", (
+                            "Cloudflare returned a JS challenge page. "
+                            "Retrying will not help. Possible causes: "
+                            "non-ASCII characters in query, IP flagged, or API key issue."
+                        )
+
                 error_text = response.text
 
                 if log_callback:
-                    log_callback(f"Handelsregister error attempt {attempt}: {response.status_code} | {error_text}")
+                    log_callback(f"Handelsregister error attempt {attempt}: {response.status_code} | {error_text[:200]}")
 
                 if attempt < MAX_RETRIES_PER_COMPANY:
                     time.sleep(SLEEP_BETWEEN_RETRIES)
