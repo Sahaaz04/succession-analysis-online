@@ -296,19 +296,22 @@ def build_shareholder_rows_from_response(data, batch_id, register_id, company_na
 
     # 1. Handle if the API returned a wrapped dictionary instead of a raw list
     if isinstance(shareholders, dict):
-        if "data" in shareholders:
+        # THIS IS THE CRITICAL FIX: Look inside the "entries" array
+        if "entries" in shareholders:
+            shareholders = shareholders["entries"]
+        elif "data" in shareholders:
             shareholders = shareholders["data"]
         elif "items" in shareholders:
             shareholders = shareholders["items"]
         else:
-            # Handle case where API returns {"John Doe": {details}, "Jane Smith": {details}}
+            # Safe fallback: extract any lists found inside the dict, or parse nested dicts
             parsed_list = []
             for key, val in shareholders.items():
-                if isinstance(val, dict):
+                if isinstance(val, list):
+                    parsed_list.extend(val)
+                elif isinstance(val, dict):
                     val["name"] = val.get("name", key)
                     parsed_list.append(val)
-                else:
-                    parsed_list.append({"name": key, "value": val})
             shareholders = parsed_list
 
     # Ensure we are iterating over a list
@@ -316,14 +319,13 @@ def build_shareholder_rows_from_response(data, batch_id, register_id, company_na
         shareholders = [shareholders]
 
     for item in shareholders:
-        # 2. Handle if the API just returns a list of name strings: ["John Doe", "Jane Doe"]
         if isinstance(item, str):
             item = {"name": item}
 
         if not isinstance(item, dict):
             continue
 
-        # 3. Broaden the search keys (APIs frequently update their naming conventions)
+        # 3. Broaden the search keys
         name = safe(
             item.get("shareholder_name") or 
             item.get("name") or 
@@ -338,8 +340,6 @@ def build_shareholder_rows_from_response(data, batch_id, register_id, company_na
             name = safe(f"{item.get('first_name', '')} {item.get('last_name', '')}").strip()
 
         if not name:
-            # If it still fails, print to console so you can see the raw payload
-            print(f"DEBUG: Skipping shareholder row - no valid name key found in payload: {item}")
             continue
 
         rows.append({
@@ -370,7 +370,7 @@ def build_shareholder_rows_from_response(data, batch_id, register_id, company_na
         })
 
     return rows
-
+    
 def build_news_rows_from_response(data, batch_id, register_id, company_name, api_status="OK", notes=""):
     rows = []
     news_items = data.get("news") or []
