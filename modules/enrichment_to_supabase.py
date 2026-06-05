@@ -748,13 +748,11 @@ def run_combined_enrichment(
                 hr_data = {}
 
         if run_handelsregister and isinstance(hr_data, dict):
-            shareholder_rows = build_shareholder_rows_from_response(
-                hr_data,
-                batch_id=None,
-                register_id=register_id,
-                company_name=company_name,
+            shareholder_rows = build_shareholder_rows(
+                company=company,
+                data=hr_data,
                 api_status=hr_status,
-                notes=hr_notes,
+                notes=hr_notes
             )
             news_rows = build_news_rows_from_response(
                 hr_data,
