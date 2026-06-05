@@ -683,19 +683,23 @@ def run_combined_enrichment(
 
 def fetch_handelsregister_data(query, api_key, log_callback=None):
     try:
-        url = "[https://api.handelsregister.ai/v1/search](https://api.handelsregister.ai/v1/search)"
+        # UPDATED: Use the new official endpoint
+        url = "https://handelsregister.ai/api/v1/fetch-organization"
+        
         headers = {
             "x-api-key": str(api_key).strip(),
             "accept": "application/json",
         }
 
-        params = {
-            "query": query,
-        }
+        # UPDATED: Parameter changed to 'q', and we explicitly request the VIP data
+        params = [
+            ("q", query),
+            ("feature", "shareholders"),
+            ("feature", "news")
+        ]
 
         for attempt in range(1, MAX_RETRIES_PER_COMPANY + 1):
             try:
-                # UPDATED: Added impersonate="chrome" here as well
                 response = requests.get(
                     url,
                     headers=headers,
@@ -719,7 +723,6 @@ def fetch_handelsregister_data(query, api_key, log_callback=None):
 
                 return response.status_code, {}, f"combined_failed_attempt_{attempt}", error_text
 
-            # Standard requests exceptions continue to work seamlessly under curl_cffi
             except requests.exceptions.Timeout:
                 error_text = f"Python request timeout after {REQUEST_TIMEOUT_SECONDS} seconds"
 
