@@ -294,23 +294,21 @@ def build_shareholder_rows_from_response(data, batch_id, register_id, company_na
     rows = []
     shareholders = data.get("shareholders") or []
 
-    # 1. Handle if the API returned a wrapped dictionary instead of a raw list
+    # 1. Unpack the "entries" array if it's wrapped in a dictionary
     if isinstance(shareholders, dict):
-        # THIS IS THE CRITICAL FIX: Look inside the "entries" array
         if "entries" in shareholders:
-            shareholders = shareholders["entries"]
+            shareholders = shareholders.get("entries", [])
         elif "data" in shareholders:
-            shareholders = shareholders["data"]
+            shareholders = shareholders.get("data", [])
         elif "items" in shareholders:
-            shareholders = shareholders["items"]
+            shareholders = shareholders.get("items", [])
         else:
-            # Safe fallback: extract any lists found inside the dict, or parse nested dicts
+            # Fallback
             parsed_list = []
             for key, val in shareholders.items():
                 if isinstance(val, list):
                     parsed_list.extend(val)
                 elif isinstance(val, dict):
-                    val["name"] = val.get("name", key)
                     parsed_list.append(val)
             shareholders = parsed_list
 
@@ -325,44 +323,61 @@ def build_shareholder_rows_from_response(data, batch_id, register_id, company_na
         if not isinstance(item, dict):
             continue
 
-        # 3. Broaden the search keys
+        # 2. THE CRITICAL FIX: Extract the nested "shareholder" object
+        sh_obj = item.get("shareholder")
+        
+        # If 'shareholder' key doesn't exist, assume the data is flat
+        if sh_obj is None:
+            sh_obj = item
+        
+        # If 'shareholder' is just a string, wrap it in a dict
+        if isinstance(sh_obj, str):
+            sh_obj = {"name": sh_obj}
+
+        # 3. Extract the name from the inner object
         name = safe(
+            sh_obj.get("name") or 
+            sh_obj.get("full_name") or 
+            sh_obj.get("company_name") or
             item.get("shareholder_name") or 
-            item.get("name") or 
-            item.get("full_name") or 
-            item.get("fullName") or 
-            item.get("entity_name") or 
-            item.get("company_name")
+            item.get("name")
         )
 
         # Fallback for split first/last names
-        if not name and (item.get("first_name") or item.get("last_name")):
-            name = safe(f"{item.get('first_name', '')} {item.get('last_name', '')}").strip()
+        if not name and (sh_obj.get("first_name") or sh_obj.get("last_name")):
+            name = safe(f"{sh_obj.get('first_name', '')} {sh_obj.get('last_name', '')}").strip()
 
+        # If we STILL don't have a name, skip the row
         if not name:
             continue
 
+        # 4. Map the fields (pulling from both the inner and outer objects)
+        contribution = safe(item.get("contribution") or item.get("contribution_amount") or sh_obj.get("contribution_amount"))
+        ratio = safe(item.get("contribution_ratio") or item.get("ownership_ratio") or sh_obj.get("ownership_ratio"))
+        address = safe(sh_obj.get("address") or sh_obj.get("shareholder_address") or item.get("address"))
+        dob = safe(sh_obj.get("dob") or sh_obj.get("birth_dob") or sh_obj.get("year_of_birth") or item.get("dob"))
+        
         rows.append({
             "batch_id": batch_id,
             "company_register_id": register_id,
             "company_name": company_name,
             "shareholder_name": name,
-            "shareholder_type": safe(item.get("shareholder_type") or item.get("type")),
-            "birth_dob": safe(item.get("birth_dob") or item.get("dob")),
-            "age": safe(item.get("age")),
-            "shareholder_address": safe(item.get("shareholder_address") or item.get("address")),
-            "shareholder_country_code": safe(item.get("shareholder_country_code") or item.get("country_code")),
-            "shareholder_registration_reference": safe(item.get("shareholder_registration_reference") or item.get("registration_reference")),
-            "contribution_amount": safe(item.get("contribution_amount") or item.get("contribution")),
-            "contribution_currency": safe(item.get("contribution_currency") or item.get("currency")),
-            "ownership_ratio": safe(item.get("ownership_ratio") or item.get("ownership")),
-            "ownership_percent": safe(item.get("ownership_percent")),
-            "matched_entity_id": safe(item.get("matched_entity_id")),
-            "matched_company_name": safe(item.get("matched_company_name")),
-            "matched_status": safe(item.get("matched_status")),
-            "register_type": safe(item.get("register_type")),
-            "register_number": safe(item.get("register_number")),
-            "register_match": safe(item.get("register_match")),
+            "shareholder_type": safe(sh_obj.get("type") or item.get("type")),
+            "birth_dob": dob,
+            "age": safe(sh_obj.get("age") or item.get("age")),
+            "shareholder_address": address,
+            "shareholder_country_code": safe(sh_obj.get("country_code") or item.get("country_code")),
+            "shareholder_registration_reference": safe(sh_obj.get("registration_reference") or item.get("registration_reference")),
+            "contribution_amount": contribution,
+            "contribution_currency": safe(item.get("currency") or item.get("contribution_currency")),
+            "ownership_ratio": ratio,
+            "ownership_percent": safe(item.get("ownership_percent") or sh_obj.get("ownership_percent")),
+            "matched_entity_id": safe(sh_obj.get("matched_entity_id") or item.get("matched_entity_id")),
+            "matched_company_name": safe(sh_obj.get("matched_company_name") or item.get("matched_company_name")),
+            "matched_status": safe(sh_obj.get("matched_status") or item.get("matched_status")),
+            "register_type": safe(sh_obj.get("register_type") or item.get("register_type")),
+            "register_number": safe(sh_obj.get("register_number") or item.get("register_number")),
+            "register_match": safe(sh_obj.get("register_match") or item.get("register_match")),
             "api_status": api_status,
             "notes": notes,
             "raw_data": item,
