@@ -39,6 +39,7 @@ def strip_internal_fields(row):
         return row
     internal_keys = {
         "id",
+        "batch_id",
     }
     return {k: v for k, v in row.items() if k not in internal_keys}
 
