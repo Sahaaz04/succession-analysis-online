@@ -7,3 +7,4 @@ anthropic
 supabase
 gspread
 google-auth
+curl_cffi
