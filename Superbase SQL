@@ -1,0 +1,974 @@
+-- ============================================================
+-- SUCCESSION ANALYSIS MASTER DATABASE SCHEMA
+-- Simplified architecture:
+-- Register ID = main company identity
+-- No batches
+-- Master companies + enrichment tables
+-- ============================================================
+
+
+-- Optional helper extension for UUIDs
+create extension if not exists "pgcrypto";
+
+
+-- ============================================================
+-- 1. MASTER COMPANIES TABLE
+-- One row per company globally.
+-- register_id is the stable unique key.
+-- ============================================================
+
+create table if not exists companies (
+    id uuid primary key default gen_random_uuid(),
+
+    input_row integer,
+
+    register_id text not null unique,
+    name text,
+    legal_form text,
+    country text,
+    postal_code text,
+    city text,
+    street text,
+    register_court text,
+    status text,
+    north_data_url text,
+    phone text,
+    fax text,
+    email text,
+    website text,
+    vat_id text,
+
+    industry_segment text,
+    wz_code text,
+    business_segment text,
+    subject text,
+
+    financials_date text,
+    base_share_capital_eur text,
+    total_assets_eur text,
+    earnings_eur text,
+    earnings_cagr_percent text,
+    revenue_eur text,
+    revenue_cagr_percent text,
+    return_on_sales_percent text,
+    equity_eur text,
+    equity_ratio_percent text,
+    return_on_equity_percent text,
+    employee_number text,
+    revenue_per_employee_eur text,
+    taxes_eur text,
+    tax_ratio_percent text,
+    cash_on_hand_eur text,
+    receivables_eur text,
+    liabilities_eur text,
+    cost_of_materials_eur text,
+    wages_and_salaries_eur text,
+    average_salaries_per_employee_eur text,
+    pension_provisions_eur text,
+    real_estate_eur text,
+
+    raw_data jsonb,
+
+    created_at timestamptz default now(),
+    updated_at timestamptz default now()
+);
+
+
+create index if not exists companies_register_id_idx
+on companies(register_id);
+
+create index if not exists companies_name_idx
+on companies(name);
+
+create index if not exists companies_city_idx
+on companies(city);
+
+create index if not exists companies_input_row_idx
+on companies(input_row);
+
+
+-- ============================================================
+-- 2. SHAREHOLDERS TABLE
+-- Multiple rows per company.
+-- Linked by company_register_id.
+-- ============================================================
+
+create table if not exists shareholders (
+    id uuid primary key default gen_random_uuid(),
+
+    input_row integer,
+
+    company_register_id text not null references companies(register_id) on delete cascade,
+    company_name text,
+
+    shareholder_name text,
+    shareholder_type text,
+    birth_dob text,
+    age text,
+    shareholder_address text,
+    shareholder_country_code text,
+    shareholder_registration_reference text,
+
+    contribution_amount text,
+    contribution_currency text,
+    ownership_ratio text,
+    ownership_percent text,
+
+    matched_entity_id text,
+    matched_company_name text,
+    matched_status text,
+    legal_form text,
+    register_court text,
+    register_type text,
+    register_number text,
+    register_match text,
+
+    api_status text,
+    notes text,
+
+    retrieved_at timestamptz default now(),
+    raw_data jsonb
+);
+
+
+create index if not exists shareholders_company_register_id_idx
+on shareholders(company_register_id);
+
+create index if not exists shareholders_name_idx
+on shareholders(shareholder_name);
+
+create index if not exists shareholders_input_row_idx
+on shareholders(input_row);
+
+
+-- Optional dedupe protection.
+-- This prevents exact duplicate shareholder rows for the same company/name/contribution.
+create unique index if not exists shareholders_dedupe_idx
+on shareholders (
+    company_register_id,
+    coalesce(shareholder_name, ''),
+    coalesce(contribution_amount, ''),
+    coalesce(ownership_ratio, '')
+);
+
+
+-- ============================================================
+-- 3. COMPANY NEWS TABLE
+-- News / insolvency / signal rows per company.
+-- Linked by company_register_id.
+-- ============================================================
+
+create table if not exists company_news (
+    id uuid primary key default gen_random_uuid(),
+
+    input_row integer,
+
+    company_register_id text not null references companies(register_id) on delete cascade,
+    company_name text,
+
+    source_type text,
+    signal_type text,
+    announcement_header text,
+    date text,
+    title text,
+    summary_context text,
+    court text,
+    case_number text,
+    register_reference text,
+    url text,
+    source_name text,
+
+    api_status text,
+    notes text,
+
+    retrieved_at timestamptz default now(),
+    raw_data jsonb
+);
+
+
+create index if not exists company_news_company_register_id_idx
+on company_news(company_register_id);
+
+create index if not exists company_news_signal_type_idx
+on company_news(signal_type);
+
+create index if not exists company_news_date_idx
+on company_news(date);
+
+create index if not exists company_news_input_row_idx
+on company_news(input_row);
+
+
+-- Optional dedupe protection.
+create unique index if not exists company_news_dedupe_idx
+on company_news (
+    company_register_id,
+    coalesce(source_type, ''),
+    coalesce(date, ''),
+    coalesce(title, ''),
+    coalesce(url, '')
+);
+
+
+-- ============================================================
+-- 4. COMPANY MODELS TABLE
+-- Claude/Gemini business model summaries.
+-- One row per company + provider + model.
+-- ============================================================
+
+create table if not exists company_models (
+    id uuid primary key default gen_random_uuid(),
+
+    input_row integer,
+
+    company_register_id text not null references companies(register_id) on delete cascade,
+    company_name text,
+    website text,
+
+    model_provider text not null,
+    model_name text not null,
+
+    summary text,
+
+    api_status text,
+    notes text,
+
+    created_at timestamptz default now(),
+    raw_data jsonb,
+
+    unique(company_register_id, model_provider, model_name)
+);
+
+
+create index if not exists company_models_company_register_id_idx
+on company_models(company_register_id);
+
+create index if not exists company_models_provider_model_idx
+on company_models(model_provider, model_name);
+
+create index if not exists company_models_input_row_idx
+on company_models(input_row);
+
+
+-- ============================================================
+-- 5. PROCESSING LOGS TABLE
+-- For debugging pipeline/API issues.
+-- ============================================================
+
+create table if not exists processing_logs (
+    id uuid primary key default gen_random_uuid(),
+
+    company_register_id text,
+    company_name text,
+    input_row integer,
+
+    module text,
+    status text,
+    message text,
+
+    created_at timestamptz default now()
+);
+
+
+create index if not exists processing_logs_company_register_id_idx
+on processing_logs(company_register_id);
+
+create index if not exists processing_logs_module_idx
+on processing_logs(module);
+
+create index if not exists processing_logs_created_at_idx
+on processing_logs(created_at);
+
+
+-- ============================================================
+-- 6. OPTIONAL VIEW: MASTER OVERVIEW
+-- Useful later for Google Sheets export.
+-- One row per company, with first/aggregated enrichment fields.
+-- ============================================================
+
+create or replace view master_overview as
+select
+    c.input_row,
+    c.register_id,
+    c.name as company_name,
+    c.legal_form,
+    c.wz_code,
+    c.business_segment,
+    c.subject as business_model,
+    cm.summary as detailed_business_model,
+    c.city,
+    c.revenue_eur,
+    c.earnings_eur as net_income_eur,
+    c.total_assets_eur,
+    c.equity_eur,
+    c.equity_ratio_percent,
+    c.financials_date,
+    c.employee_number,
+    c.website,
+
+    (
+        select count(*)
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+    ) as number_of_shareholders,
+
+    (
+        select sh.shareholder_name
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as first_shareholder_name,
+
+    (
+        select sh.age
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as first_shareholder_age,
+
+    (
+        select sh.shareholder_type
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as first_shareholder_type,
+
+    (
+        select sh.contribution_amount
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as first_shareholder_contribution,
+
+    (
+        select sh.ownership_percent
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as first_shareholder_ownership_percent,
+
+    (
+        select cn.title
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc
+        limit 1
+    ) as latest_news_title,
+
+    (
+        select cn.date
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc
+        limit 1
+    ) as latest_news_date,
+
+    (
+        select cn.signal_type
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc
+        limit 1
+    ) as latest_news_type,
+
+    c.updated_at
+
+from companies c
+left join company_models cm
+    on cm.company_register_id = c.register_id
+   and cm.model_provider = 'claude'
+where true;
+
+-- Clear all previous test data
+truncate table
+    processing_logs,
+    company_models,
+    company_news,
+    shareholders,
+    companies
+restart identity cascade;
+
+
+-- One company per Register ID
+create unique index if not exists companies_register_id_unique_idx
+on companies(register_id);
+
+drop view if exists master_overview;
+
+create view master_overview as
+select
+    c.register_id,
+    c.name as company_name,
+    c.legal_form,
+    c.wz_code,
+    c.business_segment,
+    c.subject as business_model,
+    cm.summary as detailed_business_model,
+    c.city,
+    c.revenue_eur,
+    c.earnings_eur as net_income_eur,
+    c.total_assets_eur,
+    c.equity_eur,
+    c.equity_ratio_percent,
+    c.financials_date,
+    c.employee_number,
+    c.website,
+
+    (
+        select count(*)
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+    ) as number_of_shareholders,
+
+    (
+        select sh.shareholder_name
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as first_shareholder_name,
+
+    (
+        select sh.age
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as first_shareholder_age,
+
+    (
+        select sh.shareholder_type
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as first_shareholder_type,
+
+    (
+        select sh.contribution_amount
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as first_shareholder_contribution,
+
+    (
+        select sh.ownership_percent
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as first_shareholder_ownership_percent,
+
+    (
+        select cn.title
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc
+        limit 1
+    ) as latest_news_title,
+
+    (
+        select cn.date
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc
+        limit 1
+    ) as latest_news_date,
+
+    (
+        select cn.signal_type
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc
+        limit 1
+    ) as latest_news_type,
+
+    c.updated_at as company_updated_at,
+    cm.created_at as model_updated_at,
+
+    greatest(
+        c.updated_at,
+        coalesce(cm.created_at, c.updated_at)
+    ) as last_updated_at
+
+from companies c
+left join lateral (
+    select
+        cm.summary,
+        cm.created_at
+    from company_models cm
+    where cm.company_register_id = c.register_id
+      and cm.model_provider = 'claude'
+    order by cm.created_at desc nulls last
+    limit 1
+) cm on true;
+
+create table if not exists company_fit_scores (
+    id bigserial primary key,
+    company_register_id text not null,
+    company_name text,
+    fit_score integer,
+    fit_label text,
+    fit_comment text,
+    succession_signal text,
+    financial_signal text,
+    shareholder_signal text,
+    risk_flags text,
+    recommended_action text,
+    model_provider text default 'claude',
+    model_name text,
+    api_status text,
+    notes text,
+    raw_data jsonb,
+    created_at timestamptz default now(),
+    updated_at timestamptz default now()
+);
+
+create unique index if not exists company_fit_scores_unique_idx
+on company_fit_scores(company_register_id, model_provider, model_name);
+
+alter table if exists companies enable row level security;
+alter table if exists shareholders enable row level security;
+alter table if exists company_news enable row level security;
+alter table if exists company_models enable row level security;
+alter table if exists company_fit_scores enable row level security;
+alter table if exists processing_logs enable row level security;
+
+revoke all on table companies from anon, authenticated;
+revoke all on table shareholders from anon, authenticated;
+revoke all on table company_news from anon, authenticated;
+revoke all on table company_models from anon, authenticated;
+revoke all on table company_fit_scores from anon, authenticated;
+revoke all on table processing_logs from anon, authenticated;
+
+revoke all on table master_overview from anon, authenticated;
+
+alter table if exists company_models
+add column if not exists business_segment text;
+
+alter table if exists company_models
+add column if not exists updated_at timestamptz default now();
+
+alter table if exists company_fit_scores
+add column if not exists scoring_config jsonb;
+
+-- master_overview should expose the new summary fields and separate shareholder counts.
+create or replace view master_overview as
+select
+    c.register_id,
+    c.name as company_name,
+    c.legal_form,
+    c.wz_code,
+    c.business_segment as north_data_business_segment,
+    cm.business_segment as claude_business_segment,
+    c.subject as business_model,
+    cm.summary as detailed_business_model,
+    c.city,
+    c.revenue_eur,
+    c.earnings_eur as net_income_eur,
+    c.total_assets_eur,
+    c.equity_eur,
+    c.equity_ratio_percent,
+    c.financials_date,
+    c.employee_number,
+
+    (
+        select count(*)
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+    ) as total_shareholders,
+
+    (
+        select count(*)
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+          and lower(coalesce(sh.shareholder_type, '')) like '%natural%'
+    ) as natural_shareholders,
+
+    (
+        select count(*)
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+          and lower(coalesce(sh.shareholder_type, '')) like '%corporate%'
+    ) as corporate_shareholders,
+
+    (
+        select sh.shareholder_name
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as shareholder_name,
+
+    (
+        select sh.age
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as shareholder_age,
+
+    (
+        select sh.shareholder_type
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as shareholder_type,
+
+    (
+        select sh.contribution_amount
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as shareholder_contribution,
+
+    (
+        select sh.ownership_percent
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc
+        limit 1
+    ) as shareholder_ownership_percent,
+
+    (
+        select cn.title
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc
+        limit 1
+    ) as news_title,
+
+    (
+        select cn.date
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc
+        limit 1
+    ) as news_date,
+
+    (
+        select cn.signal_type
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc
+        limit 1
+    ) as news_type,
+
+    (
+        select cn.url
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc
+        limit 1
+    ) as news_url,
+
+    fs.fit_score,
+    fs.fit_label,
+    fs.fit_comment,
+    fs.succession_signal,
+    fs.financial_signal,
+    fs.shareholder_signal,
+    fs.risk_flags,
+    fs.recommended_action,
+    fs.model_name as scoring_model,
+    coalesce(fs.updated_at, fs.created_at) as score_updated_at,
+
+    c.website,
+    c.updated_at as company_updated_at,
+    coalesce(cm.updated_at, cm.created_at) as model_updated_at,
+    greatest(
+        c.updated_at,
+        coalesce(cm.updated_at, cm.created_at, c.updated_at),
+        coalesce(fs.updated_at, fs.created_at, c.updated_at)
+    ) as last_updated_at
+
+from companies c
+left join lateral (
+    select
+        summary,
+        business_segment,
+        created_at,
+        updated_at
+    from company_models cm
+    where cm.company_register_id = c.register_id
+      and cm.model_provider = 'claude'
+    order by coalesce(cm.updated_at, cm.created_at) desc nulls last
+    limit 1
+) cm on true
+left join lateral (
+    select
+        fit_score,
+        fit_label,
+        fit_comment,
+        succession_signal,
+        financial_signal,
+        shareholder_signal,
+        risk_flags,
+        recommended_action,
+        model_name,
+        created_at,
+        updated_at
+    from company_fit_scores fs
+    where fs.company_register_id = c.register_id
+      and fs.model_provider = 'claude'
+    order by coalesce(fs.updated_at, fs.created_at) desc nulls last
+    limit 1
+) fs on true;
+
+drop view if exists master_overview;
+
+create view master_overview as
+select
+    c.register_id,
+    c.name as company_name,
+    c.legal_form,
+    c.wz_code,
+    c.business_segment as north_data_business_segment,
+    cm.business_segment as claude_business_segment,
+    c.subject as business_model,
+    cm.summary as detailed_business_model,
+    c.city,
+    c.revenue_eur,
+    c.earnings_eur as net_income_eur,
+    c.total_assets_eur,
+    c.equity_eur,
+    c.equity_ratio_percent,
+    c.financials_date,
+    c.employee_number,
+
+    (
+        select count(*)
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+    ) as total_shareholders,
+
+    (
+        select count(*)
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+          and lower(coalesce(sh.shareholder_type, '')) like '%natural%'
+    ) as natural_shareholders,
+
+    (
+        select count(*)
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+          and lower(coalesce(sh.shareholder_type, '')) like '%corporate%'
+    ) as corporate_shareholders,
+
+    (
+        select sh.shareholder_name
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc nulls last
+        limit 1
+    ) as shareholder_name,
+
+    (
+        select sh.age
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc nulls last
+        limit 1
+    ) as shareholder_age,
+
+    (
+        select sh.shareholder_type
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc nulls last
+        limit 1
+    ) as shareholder_type,
+
+    (
+        select sh.contribution_amount
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc nulls last
+        limit 1
+    ) as shareholder_contribution,
+
+    (
+        select sh.ownership_percent
+        from shareholders sh
+        where sh.company_register_id = c.register_id
+          and coalesce(sh.shareholder_name, '') <> ''
+        order by sh.retrieved_at desc nulls last
+        limit 1
+    ) as shareholder_ownership_percent,
+
+    (
+        select cn.title
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc nulls last
+        limit 1
+    ) as news_title,
+
+    (
+        select cn.date
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc nulls last
+        limit 1
+    ) as news_date,
+
+    (
+        select cn.signal_type
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc nulls last
+        limit 1
+    ) as news_type,
+
+    (
+        select cn.url
+        from company_news cn
+        where cn.company_register_id = c.register_id
+          and coalesce(cn.title, '') <> ''
+        order by cn.date desc nulls last, cn.retrieved_at desc nulls last
+        limit 1
+    ) as news_url,
+
+    fs.fit_score,
+    fs.fit_label,
+    fs.fit_comment,
+    fs.succession_signal,
+    fs.financial_signal,
+    fs.shareholder_signal,
+    fs.risk_flags,
+    fs.recommended_action,
+    fs.model_name as scoring_model,
+    coalesce(fs.updated_at, fs.created_at) as score_updated_at,
+
+    c.website,
+    c.updated_at as company_updated_at,
+    cm.created_at as model_updated_at,
+    greatest(
+        c.updated_at,
+        coalesce(cm.created_at, c.updated_at),
+        coalesce(fs.updated_at, fs.created_at, c.updated_at)
+    ) as last_updated_at
+
+from companies c
+left join lateral (
+    select
+        summary,
+        business_segment,
+        created_at
+    from company_models cm
+    where cm.company_register_id = c.register_id
+      and cm.model_provider = 'claude'
+    order by cm.created_at desc nulls last
+    limit 1
+) cm on true
+left join lateral (
+    select
+        fit_score,
+        fit_label,
+        fit_comment,
+        succession_signal,
+        financial_signal,
+        shareholder_signal,
+        risk_flags,
+        recommended_action,
+        model_name,
+        created_at,
+        updated_at
+    from company_fit_scores fs
+    where fs.company_register_id = c.register_id
+      and fs.model_provider = 'claude'
+    order by coalesce(fs.updated_at, fs.created_at) desc nulls last
+    limit 1
+) fs on true;
+
+alter table company_models
+add column if not exists business_segment text;
+
+alter table company_models
+add column if not exists business_segment text;
+
+alter table company_models
+add column if not exists updated_at timestamptz default now();
+
+update company_models
+set updated_at = coalesce(updated_at, created_at, now())
+where updated_at is null;
+
+with ranked as (
+    select
+        ctid,
+        row_number() over (
+            partition by company_register_id, model_provider
+            order by coalesce(updated_at, created_at) desc nulls last,
+                     created_at desc nulls last
+        ) as rn
+    from company_models
+)
+delete from company_models
+where ctid in (
+    select ctid
+    from ranked
+    where rn > 1
+);
+
+create unique index if not exists company_models_one_row_per_provider_idx
+on company_models(company_register_id, model_provider);
+
+SELECT column_name
+FROM information_schema.columns
+WHERE table_name = 'company_models';
+
+alter table company_fit_scores
+add column if not exists scoring_config jsonb;
+
+alter table company_fit_scores
+add column if not exists updated_at timestamptz default now();
