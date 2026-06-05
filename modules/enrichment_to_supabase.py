@@ -34,6 +34,22 @@ def clean_text(value):
 def clean_id(value):
     return clean_text(value).upper()
 
+def extract_register_number(value):
+    """
+    Extract only the numeric register number from values like:
+    'HRB 4318', 'HRB4318', 'Amtsgericht X HRB 4318', or '4318'.
+    """
+    text = clean_id(value)
+    if not text:
+        return ""
+
+    match = re.search(r"\b(?:HRB|HRA|VR|GnR|PR)\s*([0-9]+[A-Z]?)\b", text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+
+    match = re.search(r"\b([0-9]+[A-Z]?)\b", text)
+    return match.group(1).upper() if match else ""
+
 def strip_internal_fields(row):
     if not isinstance(row, dict):
         return row
