@@ -42,10 +42,6 @@ def clean_id(value):
 
 
 def to_int_or_none(value):
-    """
-    Convert values for Supabase integer columns.
-    Empty strings must become None, not "".
-    """
     if value is None:
         return None
 
@@ -66,15 +62,11 @@ def to_int_or_none(value):
 
     try:
         return int(float(text))
-    except (ValueError, TypeError):
+    except Exception:
         return None
 
 
 def to_float_or_none(value):
-    """
-    Convert values for Supabase numeric/float columns.
-    Empty strings must become None, not "".
-    """
     if value is None:
         return None
 
@@ -92,30 +84,14 @@ def to_float_or_none(value):
 
     text = text.replace("%", "").replace(",", ".")
     match = re.search(r"-?\d+(?:\.\d+)?", text)
+
     if not match:
         return None
 
     try:
         return float(match.group(0))
-    except (ValueError, TypeError):
+    except Exception:
         return None
-
-
-def none_if_blank(value):
-    """
-    Keep text values as text, but convert blank-like values to None.
-    """
-    if value is None:
-        return None
-
-    if isinstance(value, float) and pd.isna(value):
-        return None
-
-    if isinstance(value, str):
-        text = value.strip()
-        return text if text else None
-
-    return value
 
 
 def strip_internal_fields(row):
@@ -131,13 +107,6 @@ def strip_internal_fields(row):
 
 
 def sanitize_supabase_row(table_name, row):
-    """
-    Make one row safe for Supabase/Postgres inserts.
-
-    Main fix:
-    - integer columns like source_row and age cannot receive "".
-      They must receive an integer or None.
-    """
     if not isinstance(row, dict):
         return row
 
@@ -158,19 +127,17 @@ def sanitize_supabase_rows(table_name, rows):
 
 
 def extract_register_number(value):
-    """
-    Extract only the numeric register number from values like:
-    'HRB 4318', 'HRB4318', 'Amtsgericht X HRB 4318', or '4318'.
-    """
     text = clean_id(value)
+
     if not text:
         return ""
 
     match = re.search(
-        r"\b(?:HRB|HRA|VR|GnR|PR)\s*([0-9]+[A-Z]?)\b",
+        r"\b(?:HRB|HRA|VR|GNR|PR)\s*([0-9]+[A-Z]?)\b",
         text,
         flags=re.IGNORECASE,
     )
+
     if match:
         return match.group(1).upper()
 
@@ -178,8 +145,124 @@ def extract_register_number(value):
     return match.group(1).upper() if match else ""
 
 
+def recursive_dicts(obj, max_depth=5, current_depth=0):
+    if current_depth > max_depth:
+        return
+
+    if isinstance(obj, dict):
+        yield obj
+
+        for value in obj.values():
+            yield from recursive_dicts(value, max_depth=max_depth, current_depth=current_depth + 1)
+
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from recursive_dicts(item, max_depth=max_depth, current_depth=current_depth + 1)
+
+
+def first_value_by_keys(obj, keys, max_depth=5):
+    if not isinstance(obj, (dict, list)):
+        return ""
+
+    keys_lower = {k.lower() for k in keys}
+
+    for d in recursive_dicts(obj, max_depth=max_depth):
+        for key, value in d.items():
+            if str(key).lower() in keys_lower and value not in (None, "", []):
+                return value
+
+    return ""
+
+
+def extract_shareholder_entries(data):
+    """
+    Handelsregister.ai shareholder objects may appear as:
+    - shareholders: [ ... ]
+    - shareholders: {"entries": [ ... ]}
+    - shareholders: {"items": [ ... ]}
+    - shareholders: {"data": [ ... ]}
+    - ownership/shareholders nested under another object
+
+    This function normalizes those into a list.
+    """
+    if not isinstance(data, dict):
+        return []
+
+    shareholders_data = (
+        data.get("shareholders")
+        or data.get("shareholder")
+        or data.get("ownership")
+        or data.get("owners")
+        or data.get("partners")
+        or data.get("beneficial_owners")
+        or []
+    )
+
+    if isinstance(shareholders_data, list):
+        return shareholders_data
+
+    if isinstance(shareholders_data, dict):
+        for key in (
+            "entries",
+            "items",
+            "data",
+            "results",
+            "shareholders",
+            "owners",
+            "partners",
+            "beneficial_owners",
+            "ubo",
+            "ubos",
+        ):
+            value = shareholders_data.get(key)
+
+            if isinstance(value, list):
+                return value
+
+            if isinstance(value, dict):
+                nested_entries = extract_shareholder_entries(value)
+                if nested_entries:
+                    return nested_entries
+
+        return [shareholders_data]
+
+    return []
+
+
+def get_shareholder_candidate(entry):
+    if not isinstance(entry, dict):
+        return entry
+
+    for key in (
+        "shareholder",
+        "person",
+        "entity",
+        "owner",
+        "partner",
+        "holder",
+        "individual",
+        "organization",
+        "company",
+        "legal_entity",
+        "beneficial_owner",
+        "ubo",
+    ):
+        value = entry.get(key)
+
+        if isinstance(value, dict):
+            return value
+
+    return entry
+
+
 def get_shareholder_name(shareholder):
-    """Return a clean shareholder name from the different shapes the API can return."""
+    """
+    Stronger parser:
+    - Checks common direct name fields.
+    - Checks German-ish / API-ish fields.
+    - Checks nested person/company/entity blocks.
+    - Falls back to combining first/last name.
+    """
     if shareholder is None:
         return ""
 
@@ -189,7 +272,7 @@ def get_shareholder_name(shareholder):
     if not isinstance(shareholder, dict):
         return clean_text(shareholder)
 
-    for key in (
+    name_keys = (
         "name",
         "full_name",
         "display_name",
@@ -198,9 +281,22 @@ def get_shareholder_name(shareholder):
         "company_name",
         "legal_name",
         "organization_name",
+        "entity_name",
+        "owner_name",
+        "holder_name",
+        "partner_name",
+        "beneficial_owner_name",
+        "ubo_name",
         "firm",
+        "firma",
         "title",
-    ):
+        "label",
+        "caption",
+        "denomination",
+        "gesellschafter",
+    )
+
+    for key in name_keys:
         value = shareholder.get(key)
         if value:
             return clean_text(value)
@@ -209,46 +305,71 @@ def get_shareholder_name(shareholder):
         shareholder.get("first_name")
         or shareholder.get("firstname")
         or shareholder.get("given_name")
+        or shareholder.get("vorname")
     )
+
     last_name = (
         shareholder.get("last_name")
         or shareholder.get("lastname")
         or shareholder.get("family_name")
         or shareholder.get("surname")
+        or shareholder.get("nachname")
     )
 
     combined_name = clean_text(f"{safe(first_name)} {safe(last_name)}")
     if combined_name:
         return combined_name
 
-    for nested_key in ("person", "entity", "owner", "shareholder", "organization", "company"):
+    for nested_key in (
+        "shareholder",
+        "person",
+        "entity",
+        "owner",
+        "partner",
+        "holder",
+        "organization",
+        "company",
+        "legal_entity",
+        "beneficial_owner",
+        "ubo",
+    ):
         nested = shareholder.get(nested_key)
-        nested_name = get_shareholder_name(nested)
-        if nested_name:
-            return nested_name
+
+        if isinstance(nested, dict):
+            nested_name = get_shareholder_name(nested)
+            if nested_name:
+                return nested_name
+
+    recursive_name = first_value_by_keys(shareholder, name_keys, max_depth=4)
+
+    if recursive_name:
+        return clean_text(recursive_name)
 
     return ""
 
 
 def classify_shareholder(shareholder):
-    """Classify shareholder as Natural, Corporate, or Unknown."""
     if isinstance(shareholder, str):
         text = shareholder.lower()
+
     elif isinstance(shareholder, dict):
         explicit_type = safe(
             shareholder.get("type")
             or shareholder.get("entity_type")
             or shareholder.get("shareholder_type")
             or shareholder.get("legal_form")
+            or shareholder.get("person_type")
+            or shareholder.get("kind")
         ).lower()
 
         text = " ".join([explicit_type, get_shareholder_name(shareholder).lower()])
 
-        if any(k in explicit_type for k in ("person", "natural", "individual")):
+        if any(k in explicit_type for k in ("person", "natural", "individual", "private")):
             return "Natural"
 
         if any(k in explicit_type for k in ("company", "corporate", "legal", "organization", "entity")):
             return "Corporate"
+
     else:
         return "Unknown"
 
@@ -271,6 +392,10 @@ def classify_shareholder(shareholder):
         "llc",
         "foundation",
         "stiftung",
+        "verein",
+        "eg",
+        "kgaa",
+        "gmbh & co",
     )
 
     if any(marker in text for marker in corporate_markers):
@@ -280,11 +405,10 @@ def classify_shareholder(shareholder):
 
 
 def get_birth_value(shareholder):
-    """Extract birth date/year if present; otherwise return blank."""
     if not isinstance(shareholder, dict):
         return ""
 
-    for key in (
+    birth_keys = (
         "date_of_birth",
         "birth_date",
         "birthdate",
@@ -293,22 +417,17 @@ def get_birth_value(shareholder):
         "born",
         "year_of_birth",
         "birth_year",
-    ):
-        value = shareholder.get(key)
-        if value:
-            return safe(value)
+        "geburtsdatum",
+        "geburtsjahr",
+    )
 
-    for nested_key in ("person", "shareholder", "owner"):
-        nested_value = get_birth_value(shareholder.get(nested_key))
-        if nested_value:
-            return nested_value
-
-    return ""
+    value = first_value_by_keys(shareholder, birth_keys, max_depth=4)
+    return safe(value)
 
 
 def calc_age(birth_value):
-    """Calculate approximate age from YYYY-MM-DD, DD.MM.YYYY, or YYYY."""
     text = safe(birth_value)
+
     if not text:
         return None
 
@@ -317,14 +436,17 @@ def calc_age(birth_value):
     day = 1
 
     match = re.search(r"\b(19\d{2}|20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", text)
+
     if match:
         year, month, day = map(int, match.groups())
     else:
         match = re.search(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](19\d{2}|20\d{2})\b", text)
+
         if match:
             day, month, year = map(int, match.groups())
         else:
             match = re.search(r"\b(19\d{2}|20\d{2})\b", text)
+
             if match:
                 year = int(match.group(1))
 
@@ -341,9 +463,84 @@ def calc_age(birth_value):
 
 
 def make_dedupe_key(*parts):
-    """Stable key to avoid inserting duplicate shareholder rows from the same API response."""
     cleaned_parts = [clean_text(part).lower() for part in parts if clean_text(part)]
     return "|".join(cleaned_parts)
+
+
+def extract_amount_and_currency(entry):
+    contribution = {}
+
+    if isinstance(entry, dict):
+        contribution = entry.get("contribution") or entry.get("share") or entry.get("capital") or {}
+
+    contribution_amount = ""
+    contribution_currency = ""
+
+    if isinstance(contribution, dict):
+        contribution_amount = (
+            contribution.get("amount")
+            or contribution.get("value")
+            or contribution.get("nominal_value")
+            or ""
+        )
+
+        contribution_currency = (
+            contribution.get("currency")
+            or contribution.get("currency_code")
+            or ""
+        )
+
+    if isinstance(entry, dict):
+        contribution_amount = (
+            contribution_amount
+            or entry.get("contribution_amount")
+            or entry.get("amount")
+            or entry.get("capital_amount")
+            or entry.get("share_capital")
+            or entry.get("nominal_amount")
+            or ""
+        )
+
+        contribution_currency = (
+            contribution_currency
+            or entry.get("contribution_currency")
+            or entry.get("currency")
+            or entry.get("capital_currency")
+            or entry.get("currency_code")
+            or ""
+        )
+
+    return contribution_amount, contribution_currency
+
+
+def extract_ownership_values(entry):
+    if not isinstance(entry, dict):
+        return "", ""
+
+    ownership_ratio = (
+        entry.get("contribution_ratio")
+        or entry.get("ownership_ratio")
+        or entry.get("share_ratio")
+        or entry.get("ratio")
+        or entry.get("fraction")
+        or ""
+    )
+
+    ownership_percent = (
+        entry.get("ownership_percent")
+        or entry.get("ownership_percentage")
+        or entry.get("ownership_%")
+        or entry.get("percentage")
+        or entry.get("percent")
+        or entry.get("share_percent")
+        or entry.get("share_percentage")
+        or ""
+    )
+
+    if ownership_percent == "" and isinstance(ownership_ratio, (int, float)):
+        ownership_percent = round(float(ownership_ratio) * 100, 2)
+
+    return ownership_ratio, ownership_percent
 
 
 def log_to_supabase(supabase, batch_id, register_id, module, status, message):
@@ -363,8 +560,10 @@ def log_to_supabase(supabase, batch_id, register_id, module, status, message):
 
 def table_has_row(supabase, table_name, filters):
     query = supabase.table(table_name).select("id")
+
     for col, value in filters.items():
         query = query.eq(col, value)
+
     result = query.limit(1).execute()
     return bool(result.data)
 
@@ -372,8 +571,10 @@ def table_has_row(supabase, table_name, filters):
 def delete_existing_company_rows(supabase, batch_id, register_id):
     def delete_from(table_name):
         query = supabase.table(table_name).delete().eq("company_register_id", register_id)
+
         if batch_id is not None:
             query = query.eq("batch_id", batch_id)
+
         query.execute()
 
     try:
@@ -416,6 +617,7 @@ def fetch_html(url):
         impersonate="chrome",
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
+
     response.raise_for_status()
     return response.text
 
@@ -438,6 +640,7 @@ def find_internal_links(base_url, html, max_links=MAX_EXTRA_PAGES):
 
     for a in soup.find_all("a", href=True):
         href = a.get("href")
+
         if not href:
             continue
 
@@ -451,6 +654,7 @@ def find_internal_links(base_url, html, max_links=MAX_EXTRA_PAGES):
             continue
 
         absolute = absolute.split("#")[0].rstrip("/")
+
         if absolute == base_url.rstrip("/"):
             continue
 
@@ -493,6 +697,7 @@ def scrape_website(url, log_callback=None):
             except Exception as e:
                 if log_callback:
                     log_callback(f"Could not scrape extra page: {link} | {e}")
+
                 continue
 
         combined_text = "\n\n".join(all_text_parts)
@@ -528,6 +733,7 @@ Website text:
 
 def parse_claude_model_response(response_text):
     text = safe(response_text).strip()
+
     if not text:
         return "", "", "CLAUDE_ERROR", "Empty response."
 
@@ -537,12 +743,14 @@ def parse_claude_model_response(response_text):
     candidates = [text]
 
     json_match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+
     if json_match:
         candidates.append(json_match.group(0))
 
     for candidate in candidates:
         try:
             parsed = json.loads(candidate)
+
             if isinstance(parsed, dict):
                 detailed_business_model = safe(parsed.get("detailed_business_model"))
                 business_segment = safe(parsed.get("business_segment"))
@@ -559,6 +767,7 @@ def parse_claude_model_response(response_text):
     def extract_field(field_name):
         pattern = rf'"?{field_name}"?\s*:\s*"((?:\\.|[^"\\])*)"'
         match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+
         if not match:
             return ""
 
@@ -606,6 +815,7 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
         response = client.messages.create(**request_payload)
 
         text_parts = []
+
         for block in response.content:
             if getattr(block, "type", "") == "text":
                 text_parts.append(block.text)
@@ -622,10 +832,11 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
     except Exception as e:
         if log_callback:
             log_callback(f"Claude error: {e}")
+
         return "", "", "CLAUDE_ERROR", str(e)
 
 
-def build_shareholder_rows(company, data, api_status, notes):
+def build_shareholder_rows(company, data, api_status, notes, log_callback=None):
     register_id = clean_id(company.get("register_id", ""))
     company_name = clean_text(company.get("name", ""))
     source_row = to_int_or_none(company.get("source_row"))
@@ -643,20 +854,7 @@ def build_shareholder_rows(company, data, api_status, notes):
     input_register_number = extract_register_number(register_id)
     register_match = "Yes" if input_register_number and str(register_number) == input_register_number else "Review"
 
-    shareholders_data = data.get("shareholders") or []
-
-    if isinstance(shareholders_data, dict):
-        entries = (
-            shareholders_data.get("entries")
-            or shareholders_data.get("data")
-            or shareholders_data.get("items")
-            or []
-        )
-    else:
-        entries = shareholders_data
-
-    if not isinstance(entries, list):
-        entries = [entries] if entries else []
+    entries = extract_shareholder_entries(data)
 
     rows = []
 
@@ -664,79 +862,66 @@ def build_shareholder_rows(company, data, api_status, notes):
         return rows
 
     seen = set()
+    skipped_no_name = 0
+    skipped_non_dict = 0
+    skipped_duplicate = 0
 
-    for entry in entries:
+    for entry_index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
+            skipped_non_dict += 1
+
+            if log_callback:
+                log_callback(f"[SH DEBUG] {company_name}: skipped shareholder entry {entry_index}; not a dict.")
+
             continue
 
-        shareholder = (
-            entry.get("shareholder")
-            or entry.get("person")
-            or entry.get("entity")
-            or entry.get("owner")
-            or entry
-            or {}
-        )
-
-        contribution = entry.get("contribution") or entry.get("share") or {}
-
+        shareholder = get_shareholder_candidate(entry)
         shareholder_name = get_shareholder_name(shareholder)
 
         if not shareholder_name:
+            skipped_no_name += 1
+
+            if log_callback:
+                raw_preview = json.dumps(entry, ensure_ascii=False, default=str)[:1200]
+                log_callback(
+                    f"[SH DEBUG] {company_name}: skipped shareholder entry {entry_index}; "
+                    f"could not extract shareholder name. Entry keys: {list(entry.keys())}. "
+                    f"Raw preview: {raw_preview}"
+                )
+
             continue
 
         shareholder_type = classify_shareholder(shareholder)
         birth_value = get_birth_value(shareholder)
         age = calc_age(birth_value)
 
-        contribution_amount = ""
-        contribution_currency = ""
-
-        if isinstance(contribution, dict):
-            contribution_amount = contribution.get("amount") or ""
-            contribution_currency = contribution.get("currency") or ""
-
-        contribution_amount = (
-            contribution_amount
-            or entry.get("contribution_amount")
-            or entry.get("amount")
-            or entry.get("capital_amount")
-            or ""
-        )
-
-        contribution_currency = (
-            contribution_currency
-            or entry.get("contribution_currency")
-            or entry.get("currency")
-            or entry.get("capital_currency")
-            or ""
-        )
-
-        ownership_ratio = (
-            entry.get("contribution_ratio")
-            or entry.get("ownership_ratio")
-            or entry.get("share_ratio")
-            or ""
-        )
-
-        ownership_percent = (
-            entry.get("ownership_percent")
-            or entry.get("ownership_percentage")
-            or entry.get("ownership_%")
-            or ""
-        )
-
-        if ownership_percent == "" and isinstance(ownership_ratio, (int, float)):
-            ownership_percent = round(ownership_ratio * 100, 2)
+        contribution_amount, contribution_currency = extract_amount_and_currency(entry)
+        ownership_ratio, ownership_percent = extract_ownership_values(entry)
 
         shareholder_address = ""
         shareholder_country_code = ""
         shareholder_registration_reference = ""
 
         if isinstance(shareholder, dict):
-            shareholder_address = shareholder.get("address") or ""
-            shareholder_country_code = shareholder.get("country_code") or ""
-            shareholder_registration_reference = shareholder.get("registration_reference") or ""
+            shareholder_address = (
+                shareholder.get("address")
+                or first_value_by_keys(shareholder, ("address", "street_address", "full_address"), max_depth=3)
+                or ""
+            )
+
+            shareholder_country_code = (
+                shareholder.get("country_code")
+                or shareholder.get("country")
+                or first_value_by_keys(shareholder, ("country_code", "country"), max_depth=3)
+                or ""
+            )
+
+            shareholder_registration_reference = (
+                shareholder.get("registration_reference")
+                or shareholder.get("register_reference")
+                or shareholder.get("registration_number")
+                or ""
+            )
 
         dedupe_key = make_dedupe_key(
             register_id,
@@ -747,6 +932,7 @@ def build_shareholder_rows(company, data, api_status, notes):
         )
 
         if dedupe_key in seen:
+            skipped_duplicate += 1
             continue
 
         seen.add(dedupe_key)
@@ -783,6 +969,13 @@ def build_shareholder_rows(company, data, api_status, notes):
             }
         )
 
+    if log_callback and (skipped_no_name or skipped_non_dict or skipped_duplicate):
+        log_callback(
+            f"[SH DEBUG] {company_name}: raw shareholder entries={len(entries)}, "
+            f"saved={len(rows)}, skipped_non_dict={skipped_non_dict}, "
+            f"skipped_no_name={skipped_no_name}, skipped_duplicate={skipped_duplicate}"
+        )
+
     return rows
 
 
@@ -791,13 +984,24 @@ def build_news_rows_from_response(data, batch_id, register_id, company_name, api
     news_items = data.get("news") or []
 
     if isinstance(news_items, dict):
-        news_items = [news_items]
+        nested_news = (
+            news_items.get("entries")
+            or news_items.get("items")
+            or news_items.get("data")
+            or news_items.get("results")
+        )
+
+        if isinstance(nested_news, list):
+            news_items = nested_news
+        else:
+            news_items = [news_items]
 
     for item in news_items:
         if not isinstance(item, dict):
             continue
 
         title = safe(item.get("title") or item.get("announcement_header"))
+
         if not title:
             continue
 
@@ -866,7 +1070,6 @@ def upsert_rows(supabase, table_name, rows, conflict=None):
         return 0
 
     safe_rows = sanitize_supabase_rows(table_name, rows)
-
     query = supabase.table(table_name).upsert(safe_rows)
 
     if conflict:
@@ -1085,30 +1288,26 @@ def run_combined_enrichment(
                                 break
 
                 if log_callback:
-                    sh_raw = hr_data.get("shareholders") if isinstance(hr_data, dict) else []
+                    sh_entries = extract_shareholder_entries(hr_data) if isinstance(hr_data, dict) else []
                     news_raw = hr_data.get("news") if isinstance(hr_data, dict) else []
 
-                    if isinstance(sh_raw, dict):
-                        sh_count = len(
-                            sh_raw.get("entries")
-                            or sh_raw.get("data")
-                            or sh_raw.get("items")
-                            or []
-                        )
-                    else:
-                        sh_count = len(sh_raw or [])
-
                     if isinstance(news_raw, dict):
-                        news_count = 1
+                        nested_news = (
+                            news_raw.get("entries")
+                            or news_raw.get("items")
+                            or news_raw.get("data")
+                            or news_raw.get("results")
+                        )
+                        news_count = len(nested_news) if isinstance(nested_news, list) else 1
                     else:
                         news_count = len(news_raw or [])
 
-                    top_keys = list(hr_data.keys())[:10] if isinstance(hr_data, dict) else type(hr_data).__name__
+                    top_keys = list(hr_data.keys())[:12] if isinstance(hr_data, dict) else type(hr_data).__name__
 
                     log_callback(
                         f"Handelsregister raw response — status: {api_status} | "
                         f"top-level keys: {top_keys} | "
-                        f"shareholders found: {sh_count} | news found: {news_count}"
+                        f"shareholders found: {len(sh_entries)} | news found: {news_count}"
                     )
 
             except Exception as e:
@@ -1125,6 +1324,7 @@ def run_combined_enrichment(
                 data=hr_data,
                 api_status=hr_status,
                 notes=hr_notes,
+                log_callback=log_callback,
             )
 
             news_rows = build_news_rows_from_response(
@@ -1205,7 +1405,7 @@ def run_combined_enrichment(
 
         if log_callback:
             log_callback(
-                f"Completed {company_name} | HR rows saved: {company_shareholder_count} | "
+                f"Completed {company_name} | Shareholder rows saved: {company_shareholder_count} | "
                 f"News rows saved: {company_news_count} | Model rows saved: {company_model_saved}"
             )
 
