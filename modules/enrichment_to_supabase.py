@@ -5,10 +5,12 @@ import re
 import time
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
+
 import pandas as pd
-from curl_cffi import requests  # Swapped standard requests for curl_cffi
+from curl_cffi import requests
 from anthropic import Anthropic
 from bs4 import BeautifulSoup
+
 
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_RETRIES_PER_COMPANY = 3
@@ -20,19 +22,140 @@ MAX_MODEL_SUMMARY_CHARS = 6000
 MAX_NEWS_ROWS = 10
 MAX_SHAREHOLDER_ROWS = 20
 
+
 def now_iso():
     return datetime.utcnow().isoformat()
+
 
 def safe(value):
     if value is None:
         return ""
     return str(value).strip()
 
+
 def clean_text(value):
     return re.sub(r"\s+", " ", safe(value)).strip()
 
+
 def clean_id(value):
     return clean_text(value).upper()
+
+
+def to_int_or_none(value):
+    """
+    Convert values for Supabase integer columns.
+    Empty strings must become None, not "".
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return int(value)
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        if pd.isna(value):
+            return None
+        return int(value)
+
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "nan", "null"}:
+        return None
+
+    try:
+        return int(float(text))
+    except (ValueError, TypeError):
+        return None
+
+
+def to_float_or_none(value):
+    """
+    Convert values for Supabase numeric/float columns.
+    Empty strings must become None, not "".
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        if pd.isna(value):
+            return None
+        return float(value)
+
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "nan", "null"}:
+        return None
+
+    text = text.replace("%", "").replace(",", ".")
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+
+    try:
+        return float(match.group(0))
+    except (ValueError, TypeError):
+        return None
+
+
+def none_if_blank(value):
+    """
+    Keep text values as text, but convert blank-like values to None.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, float) and pd.isna(value):
+        return None
+
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text else None
+
+    return value
+
+
+def strip_internal_fields(row):
+    if not isinstance(row, dict):
+        return row
+
+    internal_keys = {
+        "id",
+        "batch_id",
+    }
+
+    return {k: v for k, v in row.items() if k not in internal_keys}
+
+
+def sanitize_supabase_row(table_name, row):
+    """
+    Make one row safe for Supabase/Postgres inserts.
+
+    Main fix:
+    - integer columns like source_row and age cannot receive "".
+      They must receive an integer or None.
+    """
+    if not isinstance(row, dict):
+        return row
+
+    cleaned = strip_internal_fields(row)
+
+    if table_name == "shareholders":
+        if "source_row" in cleaned:
+            cleaned["source_row"] = to_int_or_none(cleaned.get("source_row"))
+
+        if "age" in cleaned:
+            cleaned["age"] = to_int_or_none(cleaned.get("age"))
+
+    return cleaned
+
+
+def sanitize_supabase_rows(table_name, rows):
+    return [sanitize_supabase_row(table_name, row) for row in rows]
+
 
 def extract_register_number(value):
     """
@@ -43,21 +166,17 @@ def extract_register_number(value):
     if not text:
         return ""
 
-    match = re.search(r"\b(?:HRB|HRA|VR|GnR|PR)\s*([0-9]+[A-Z]?)\b", text, flags=re.IGNORECASE)
+    match = re.search(
+        r"\b(?:HRB|HRA|VR|GnR|PR)\s*([0-9]+[A-Z]?)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
     if match:
         return match.group(1).upper()
 
     match = re.search(r"\b([0-9]+[A-Z]?)\b", text)
     return match.group(1).upper() if match else ""
 
-def strip_internal_fields(row):
-    if not isinstance(row, dict):
-        return row
-    internal_keys = {
-        "id",
-        "batch_id",
-    }
-    return {k: v for k, v in row.items() if k not in internal_keys}
 
 def get_shareholder_name(shareholder):
     """Return a clean shareholder name from the different shapes the API can return."""
@@ -86,8 +205,18 @@ def get_shareholder_name(shareholder):
         if value:
             return clean_text(value)
 
-    first_name = shareholder.get("first_name") or shareholder.get("firstname") or shareholder.get("given_name")
-    last_name = shareholder.get("last_name") or shareholder.get("lastname") or shareholder.get("family_name") or shareholder.get("surname")
+    first_name = (
+        shareholder.get("first_name")
+        or shareholder.get("firstname")
+        or shareholder.get("given_name")
+    )
+    last_name = (
+        shareholder.get("last_name")
+        or shareholder.get("lastname")
+        or shareholder.get("family_name")
+        or shareholder.get("surname")
+    )
+
     combined_name = clean_text(f"{safe(first_name)} {safe(last_name)}")
     if combined_name:
         return combined_name
@@ -117,14 +246,31 @@ def classify_shareholder(shareholder):
 
         if any(k in explicit_type for k in ("person", "natural", "individual")):
             return "Natural"
+
         if any(k in explicit_type for k in ("company", "corporate", "legal", "organization", "entity")):
             return "Corporate"
     else:
         return "Unknown"
 
     corporate_markers = (
-        "gmbh", "ug", "ag", "kg", "ohg", "se", "ltd", "limited", "holding",
-        "s.a.", "sarl", "bv", "nv", "inc", "corp", "llc", "foundation", "stiftung"
+        "gmbh",
+        "ug",
+        "ag",
+        "kg",
+        "ohg",
+        "se",
+        "ltd",
+        "limited",
+        "holding",
+        "s.a.",
+        "sarl",
+        "bv",
+        "nv",
+        "inc",
+        "corp",
+        "llc",
+        "foundation",
+        "stiftung",
     )
 
     if any(marker in text for marker in corporate_markers):
@@ -199,17 +345,21 @@ def make_dedupe_key(*parts):
     cleaned_parts = [clean_text(part).lower() for part in parts if clean_text(part)]
     return "|".join(cleaned_parts)
 
+
 def log_to_supabase(supabase, batch_id, register_id, module, status, message):
     try:
-        supabase.table("processing_logs").insert({
-            "batch_id": batch_id,
-            "company_register_id": register_id,
-            "module": module,
-            "status": status,
-            "message": safe(message)[:1000],
-        }).execute()
+        supabase.table("processing_logs").insert(
+            {
+                "batch_id": batch_id,
+                "company_register_id": register_id,
+                "module": module,
+                "status": status,
+                "message": safe(message)[:1000],
+            }
+        ).execute()
     except Exception:
         pass
+
 
 def table_has_row(supabase, table_name, filters):
     query = supabase.table(table_name).select("id")
@@ -218,12 +368,14 @@ def table_has_row(supabase, table_name, filters):
     result = query.limit(1).execute()
     return bool(result.data)
 
+
 def delete_existing_company_rows(supabase, batch_id, register_id):
     def delete_from(table_name):
         query = supabase.table(table_name).delete().eq("company_register_id", register_id)
         if batch_id is not None:
             query = query.eq("batch_id", batch_id)
         query.execute()
+
     try:
         delete_from("shareholders")
     except Exception:
@@ -235,10 +387,7 @@ def delete_existing_company_rows(supabase, batch_id, register_id):
         pass
 
     try:
-        supabase.table("company_models") \
-            .delete() \
-            .eq("company_register_id", register_id) \
-            .execute()
+        supabase.table("company_models").delete().eq("company_register_id", register_id).execute()
     except Exception:
         pass
 
@@ -247,25 +396,39 @@ def delete_existing_company_rows(supabase, batch_id, register_id):
     except Exception:
         pass
 
+
 def delete_existing_enrichment_rows(supabase, batch_id, register_id):
     delete_existing_company_rows(supabase, batch_id, register_id)
 
+
 def fetch_html(url):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
     }
-    # UPDATED: Impersonating Chrome's TLS fingerprint to bypass Cloudflare
-    response = requests.get(url, headers=headers, impersonate="chrome", timeout=REQUEST_TIMEOUT_SECONDS)
+
+    response = requests.get(
+        url,
+        headers=headers,
+        impersonate="chrome",
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
     response.raise_for_status()
     return response.text
 
+
 def extract_text_from_html(html):
     soup = BeautifulSoup(html, "html.parser")
+
     for tag in soup(["script", "style", "noscript", "svg", "header", "footer"]):
         tag.decompose()
 
     text = soup.get_text(" ", strip=True)
     return clean_text(text)
+
 
 def find_internal_links(base_url, html, max_links=MAX_EXTRA_PAGES):
     soup = BeautifulSoup(html, "html.parser")
@@ -302,8 +465,12 @@ def find_internal_links(base_url, html, max_links=MAX_EXTRA_PAGES):
 
     return links
 
+
 def scrape_website(url, log_callback=None):
     try:
+        if not url:
+            return "", "NO_WEBSITE", "No website provided."
+
         homepage_html = fetch_html(url)
         homepage_text = extract_text_from_html(homepage_html)
         all_text_parts = [homepage_text]
@@ -317,9 +484,12 @@ def scrape_website(url, log_callback=None):
 
                 html = fetch_html(link)
                 page_text = extract_text_from_html(html)
+
                 if page_text:
                     all_text_parts.append(f"\nPage: {link}\n{page_text}")
+
                 time.sleep(0.5)
+
             except Exception as e:
                 if log_callback:
                     log_callback(f"Could not scrape extra page: {link} | {e}")
@@ -330,6 +500,7 @@ def scrape_website(url, log_callback=None):
 
     except Exception as e:
         return "", "SCRAPE_ERROR", str(e)
+
 
 def build_claude_prompt(company_name, url, website_text):
     return f"""
@@ -354,12 +525,13 @@ Website text:
 {website_text}
 """.strip()
 
+
 def parse_claude_model_response(response_text):
     text = safe(response_text).strip()
     if not text:
         return "", "", "CLAUDE_ERROR", "Empty response."
 
-    text = re.sub(r"^(?:json)?\s*", "", text, flags=re.IGNORECASE | re.MULTILINE)
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE | re.MULTILINE)
     text = re.sub(r"\s*```$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
 
     candidates = [text]
@@ -378,7 +550,9 @@ def parse_claude_model_response(response_text):
                 if detailed_business_model or business_segment:
                     if not detailed_business_model:
                         detailed_business_model = text[:MAX_MODEL_SUMMARY_CHARS]
+
                     return detailed_business_model, business_segment, "OK", ""
+
         except Exception:
             pass
 
@@ -387,7 +561,9 @@ def parse_claude_model_response(response_text):
         match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
         if not match:
             return ""
+
         raw_value = match.group(1)
+
         try:
             return bytes(raw_value, "utf-8").decode("unicode_escape")
         except Exception:
@@ -401,9 +577,11 @@ def parse_claude_model_response(response_text):
 
     return detailed_business_model, business_segment, "OK", ""
 
+
 def summarize_with_claude(api_key, model_name, company_name, url, website_text, log_callback=None):
     if not url:
         return "", "", "NO_WEBSITE", "No website provided."
+
     if not website_text:
         return "", "", "NO_TEXT", "No website text extracted."
 
@@ -446,10 +624,11 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
             log_callback(f"Claude error: {e}")
         return "", "", "CLAUDE_ERROR", str(e)
 
+
 def build_shareholder_rows(company, data, api_status, notes):
     register_id = clean_id(company.get("register_id", ""))
     company_name = clean_text(company.get("name", ""))
-    source_row = company.get("source_row", "")
+    source_row = to_int_or_none(company.get("source_row"))
 
     matched_entity_id = safe(data.get("entity_id"))
     matched_name = safe(data.get("name"))
@@ -464,8 +643,8 @@ def build_shareholder_rows(company, data, api_status, notes):
     input_register_number = extract_register_number(register_id)
     register_match = "Yes" if input_register_number and str(register_number) == input_register_number else "Review"
 
-    # --- THE FIX: Correctly unwrap the API's nested dictionary to get the actual list ---
     shareholders_data = data.get("shareholders") or []
+
     if isinstance(shareholders_data, dict):
         entries = (
             shareholders_data.get("entries")
@@ -476,10 +655,8 @@ def build_shareholder_rows(company, data, api_status, notes):
     else:
         entries = shareholders_data
 
-    # Fallback to ensure we are iterating over a list
     if not isinstance(entries, list):
-         entries = [entries] if entries else []
-    # ------------------------------------------------------------------------------------
+        entries = [entries] if entries else []
 
     rows = []
 
@@ -492,7 +669,6 @@ def build_shareholder_rows(company, data, api_status, notes):
         if not isinstance(entry, dict):
             continue
 
-        # --- RESTORED: Your robust parsing logic ---
         shareholder = (
             entry.get("shareholder")
             or entry.get("person")
@@ -502,11 +678,7 @@ def build_shareholder_rows(company, data, api_status, notes):
             or {}
         )
 
-        contribution = (
-            entry.get("contribution")
-            or entry.get("share")
-            or {}
-        )
+        contribution = entry.get("contribution") or entry.get("share") or {}
 
         shareholder_name = get_shareholder_name(shareholder)
 
@@ -520,7 +692,6 @@ def build_shareholder_rows(company, data, api_status, notes):
         contribution_amount = ""
         contribution_currency = ""
 
-        # This is what prevents that ugly JSON dictionary from showing up in your sheet!
         if isinstance(contribution, dict):
             contribution_amount = contribution.get("amount") or ""
             contribution_currency = contribution.get("currency") or ""
@@ -580,41 +751,45 @@ def build_shareholder_rows(company, data, api_status, notes):
 
         seen.add(dedupe_key)
 
-        rows.append({
-            "company_register_id": register_id,
-            "company_name": company_name,
-            "shareholder_name": shareholder_name,
-            "shareholder_type": shareholder_type,
-            "birth_dob": birth_value,
-            "age": str(age) if age is not None else "",
-            "shareholder_address": safe(shareholder_address),
-            "shareholder_country_code": safe(shareholder_country_code),
-            "shareholder_registration_reference": safe(shareholder_registration_reference),
-            "contribution_amount": safe(contribution_amount),
-            "contribution_currency": safe(contribution_currency),
-            "ownership_ratio": safe(ownership_ratio),
-            "ownership_percent": safe(ownership_percent),
-            "matched_entity_id": matched_entity_id,
-            "matched_company_name": matched_name,
-            "matched_status": matched_status,
-            "legal_form": legal_form,
-            "register_court": court,
-            "register_type": register_type,
-            "register_number": register_number,
-            "register_match": register_match,
-            "api_status": str(api_status),
-            "notes": notes or "",
-            "retrieved_at": now_iso(),
-            "raw_data": entry,
-            "dedupe_key": dedupe_key,
-            "source_row": source_row,
-        })
+        rows.append(
+            {
+                "company_register_id": register_id,
+                "company_name": company_name,
+                "shareholder_name": shareholder_name,
+                "shareholder_type": shareholder_type,
+                "birth_dob": birth_value,
+                "age": to_int_or_none(age),
+                "shareholder_address": safe(shareholder_address),
+                "shareholder_country_code": safe(shareholder_country_code),
+                "shareholder_registration_reference": safe(shareholder_registration_reference),
+                "contribution_amount": safe(contribution_amount),
+                "contribution_currency": safe(contribution_currency),
+                "ownership_ratio": safe(ownership_ratio),
+                "ownership_percent": safe(ownership_percent),
+                "matched_entity_id": matched_entity_id,
+                "matched_company_name": matched_name,
+                "matched_status": matched_status,
+                "legal_form": legal_form,
+                "register_court": court,
+                "register_type": register_type,
+                "register_number": register_number,
+                "register_match": register_match,
+                "api_status": str(api_status),
+                "notes": notes or "",
+                "retrieved_at": now_iso(),
+                "raw_data": entry,
+                "dedupe_key": dedupe_key,
+                "source_row": to_int_or_none(source_row),
+            }
+        )
 
     return rows
-    
+
+
 def build_news_rows_from_response(data, batch_id, register_id, company_name, api_status="OK", notes=""):
     rows = []
     news_items = data.get("news") or []
+
     if isinstance(news_items, dict):
         news_items = [news_items]
 
@@ -626,28 +801,31 @@ def build_news_rows_from_response(data, batch_id, register_id, company_name, api
         if not title:
             continue
 
-        rows.append({
-            "batch_id": batch_id,
-            "company_register_id": register_id,
-            "company_name": company_name,
-            "source_type": safe(item.get("source_type") or item.get("source")),
-            "signal_type": safe(item.get("signal_type") or item.get("type")),
-            "announcement_header": safe(item.get("announcement_header")),
-            "date": safe(item.get("publication_date") or item.get("date")),
-            "title": title,
-            "summary_context": safe(item.get("summary_context") or item.get("summary")),
-            "court": safe(item.get("court")),
-            "case_number": safe(item.get("case_number")),
-            "register_reference": safe(item.get("register_reference")),
-            "url": safe(item.get("url")),
-            "source_name": safe(item.get("source_name") or item.get("source")),
-            "api_status": api_status,
-            "notes": notes,
-            "raw_data": item,
-            "retrieved_at": now_iso(),
-        })
+        rows.append(
+            {
+                "batch_id": batch_id,
+                "company_register_id": register_id,
+                "company_name": company_name,
+                "source_type": safe(item.get("source_type") or item.get("source")),
+                "signal_type": safe(item.get("signal_type") or item.get("type")),
+                "announcement_header": safe(item.get("announcement_header")),
+                "date": safe(item.get("publication_date") or item.get("date")),
+                "title": title,
+                "summary_context": safe(item.get("summary_context") or item.get("summary")),
+                "court": safe(item.get("court")),
+                "case_number": safe(item.get("case_number")),
+                "register_reference": safe(item.get("register_reference")),
+                "url": safe(item.get("url")),
+                "source_name": safe(item.get("source_name") or item.get("source")),
+                "api_status": api_status,
+                "notes": notes,
+                "raw_data": item,
+                "retrieved_at": now_iso(),
+            }
+        )
 
     return rows
+
 
 def build_model_row(
     company_name,
@@ -657,9 +835,10 @@ def build_model_row(
     business_segment,
     model_name,
     api_status="OK",
-    notes=""
+    notes="",
 ):
     timestamp = now_iso()
+
     return {
         "company_register_id": register_id,
         "company_name": company_name,
@@ -681,26 +860,36 @@ def build_model_row(
         },
     }
 
+
 def upsert_rows(supabase, table_name, rows, conflict=None):
     if not rows:
         return 0
-    query = supabase.table(table_name).upsert(rows)
+
+    safe_rows = sanitize_supabase_rows(table_name, rows)
+
+    query = supabase.table(table_name).upsert(safe_rows)
+
     if conflict:
         query = query.on_conflict(conflict)
+
     query.execute()
     return len(rows)
+
 
 def save_companies_to_master(supabase, company_rows, update_existing_companies=True, log_callback=None):
     inserted = 0
     updated = 0
     skipped = 0
     companies_for_enrichment = []
-    
-    for row in company_rows:
+
+    for row_index, row in enumerate(company_rows, start=1):
         register_id = clean_id(row.get("register_id"))
         company_name = safe(row.get("company_name") or row.get("name"))
+
         if not register_id or not company_name:
             continue
+
+        source_row = to_int_or_none(row.get("source_row")) or row_index
 
         payload = {
             "register_id": register_id,
@@ -745,38 +934,47 @@ def save_companies_to_master(supabase, company_rows, update_existing_companies=T
                     strip_internal_fields(payload),
                     on_conflict="register_id",
                 ).execute()
+
                 updated += 1
+
                 if log_callback:
                     log_callback(f"Company exists, updated company info: {company_name} | {register_id}")
+
             else:
                 skipped += 1
+
                 if log_callback:
                     log_callback(f"Company exists, skipped company update: {company_name} | {register_id}")
+
         else:
             supabase.table("companies").insert(strip_internal_fields(payload)).execute()
             inserted += 1
+
             if log_callback:
                 log_callback(f"Company inserted: {company_name} | {register_id}")
 
-        companies_for_enrichment.append({
-            "register_id": register_id,
-            "name": company_name,
-            "website": safe(row.get("website")),
-            "city": safe(row.get("city")),
-            "legal_form": safe(row.get("legal_form")),
-            "status": safe(row.get("status")),
-            "business_segment": safe(row.get("business_segment")),
-            "subject": safe(row.get("subject")),
-            "wz_code": safe(row.get("wz_code")),
-            "employee_number": row.get("employee_number"),
-            "revenue_eur": row.get("revenue_eur"),
-            "earnings_eur": row.get("earnings_eur"),
-            "total_assets_eur": row.get("total_assets_eur"),
-            "equity_eur": row.get("equity_eur"),
-            "equity_ratio_percent": row.get("equity_ratio_percent"),
-            "financials_date": safe(row.get("financials_date")),
-            "raw_data": row,
-        })
+        companies_for_enrichment.append(
+            {
+                "register_id": register_id,
+                "name": company_name,
+                "website": safe(row.get("website")),
+                "city": safe(row.get("city")),
+                "legal_form": safe(row.get("legal_form")),
+                "status": safe(row.get("status")),
+                "business_segment": safe(row.get("business_segment")),
+                "subject": safe(row.get("subject")),
+                "wz_code": safe(row.get("wz_code")),
+                "employee_number": row.get("employee_number"),
+                "revenue_eur": row.get("revenue_eur"),
+                "earnings_eur": row.get("earnings_eur"),
+                "total_assets_eur": row.get("total_assets_eur"),
+                "equity_eur": row.get("equity_eur"),
+                "equity_ratio_percent": row.get("equity_ratio_percent"),
+                "financials_date": safe(row.get("financials_date")),
+                "source_row": source_row,
+                "raw_data": row,
+            }
+        )
 
     return {
         "companies_read": len(company_rows),
@@ -785,6 +983,7 @@ def save_companies_to_master(supabase, company_rows, update_existing_companies=T
         "skipped": skipped,
         "companies_for_enrichment": companies_for_enrichment,
     }
+
 
 def run_combined_enrichment(
     supabase,
@@ -802,6 +1001,7 @@ def run_combined_enrichment(
     shareholder_rows_saved = 0
     news_rows_saved = 0
     model_rows_saved = 0
+
     all_shareholder_rows = []
     all_news_rows = []
     all_model_rows = []
@@ -814,6 +1014,7 @@ def run_combined_enrichment(
         register_id = clean_id(company.get("register_id"))
         company_name = safe(company.get("name"))
         website = safe(company.get("website"))
+        source_row = to_int_or_none(company.get("source_row")) or idx
 
         if not register_id or not company_name:
             continue
@@ -828,11 +1029,13 @@ def run_combined_enrichment(
             "shareholders",
             {"company_register_id": register_id},
         )
+
         existing_news = table_has_row(
             supabase,
             "company_news",
             {"company_register_id": register_id},
         )
+
         existing_model = table_has_row(
             supabase,
             "company_models",
@@ -847,7 +1050,6 @@ def run_combined_enrichment(
         if replace_existing_enrichment:
             delete_existing_enrichment_rows(supabase, None, register_id)
 
-        # Per-company counters (reset each iteration so the completion log is accurate)
         company_shareholder_count = 0
         company_news_count = 0
         company_model_saved = 0
@@ -856,60 +1058,75 @@ def run_combined_enrichment(
         hr_status = "SKIPPED"
         hr_notes = ""
 
-        hr_data = {}
-        hr_status = "SKIPPED"
-        hr_notes = ""
-
         if run_handelsregister:
             try:
                 query = company_name
+
                 api_status, hr_data, _, hr_notes = fetch_handelsregister_data(
                     query=query,
                     api_key=handelsregister_api_key,
                     log_callback=log_callback,
                 )
-                # api_status is the HTTP status code (int 200) on success
+
                 hr_status = "OK" if api_status == 200 else str(api_status)
 
-                # --- FIX: Normalize nested API response structures ---
-                # The handelsregister API may wrap the payload under a "data"
-                # or "result" key. Unwrap one level so that build_*_from_response
-                # can always find "shareholders" and "news" at the top level.
                 if isinstance(hr_data, dict):
                     if "shareholders" not in hr_data and "news" not in hr_data:
                         for wrapper_key in ("data", "result", "company", "organization"):
                             nested = hr_data.get(wrapper_key)
+
                             if isinstance(nested, dict) and (
                                 "shareholders" in nested or "news" in nested
                             ):
                                 if log_callback:
-                                    log_callback(
-                                        f"Unwrapping API response from key '{wrapper_key}'"
-                                    )
+                                    log_callback(f"Unwrapping API response from key '{wrapper_key}'")
+
                                 hr_data = nested
                                 break
 
                 if log_callback:
-                    sh_count = len(hr_data.get("shareholders") or []) if isinstance(hr_data, dict) else 0
-                    news_count = len(hr_data.get("news") or []) if isinstance(hr_data, dict) else 0
+                    sh_raw = hr_data.get("shareholders") if isinstance(hr_data, dict) else []
+                    news_raw = hr_data.get("news") if isinstance(hr_data, dict) else []
+
+                    if isinstance(sh_raw, dict):
+                        sh_count = len(
+                            sh_raw.get("entries")
+                            or sh_raw.get("data")
+                            or sh_raw.get("items")
+                            or []
+                        )
+                    else:
+                        sh_count = len(sh_raw or [])
+
+                    if isinstance(news_raw, dict):
+                        news_count = 1
+                    else:
+                        news_count = len(news_raw or [])
+
                     top_keys = list(hr_data.keys())[:10] if isinstance(hr_data, dict) else type(hr_data).__name__
+
                     log_callback(
                         f"Handelsregister raw response — status: {api_status} | "
                         f"top-level keys: {top_keys} | "
                         f"shareholders found: {sh_count} | news found: {news_count}"
                     )
+
             except Exception as e:
                 hr_status = "ERROR"
                 hr_notes = str(e)
                 hr_data = {}
 
         if run_handelsregister and isinstance(hr_data, dict):
+            company_for_rows = dict(company)
+            company_for_rows["source_row"] = source_row
+
             shareholder_rows = build_shareholder_rows(
-                company=company,
+                company=company_for_rows,
                 data=hr_data,
                 api_status=hr_status,
-                notes=hr_notes
+                notes=hr_notes,
             )
+
             news_rows = build_news_rows_from_response(
                 hr_data,
                 batch_id=None,
@@ -921,8 +1138,9 @@ def run_combined_enrichment(
 
             if shareholder_rows:
                 supabase.table("shareholders").insert(
-                    [strip_internal_fields(r) for r in shareholder_rows]
+                    sanitize_supabase_rows("shareholders", shareholder_rows)
                 ).execute()
+
                 company_shareholder_count = len(shareholder_rows)
                 shareholder_rows_saved += company_shareholder_count
                 all_shareholder_rows.extend(shareholder_rows)
@@ -930,8 +1148,9 @@ def run_combined_enrichment(
 
             if news_rows:
                 supabase.table("company_news").insert(
-                    [strip_internal_fields(r) for r in news_rows]
+                    sanitize_supabase_rows("company_news", news_rows)
                 ).execute()
+
                 company_news_count = len(news_rows)
                 news_rows_saved += company_news_count
                 all_news_rows.extend(news_rows)
@@ -939,7 +1158,11 @@ def run_combined_enrichment(
 
         if run_claude:
             try:
-                website_text, scrape_status, scrape_notes = scrape_website(website, log_callback=log_callback)
+                website_text, scrape_status, scrape_notes = scrape_website(
+                    website,
+                    log_callback=log_callback,
+                )
+
                 if scrape_status != "OK" and log_callback:
                     log_callback(f"Website scrape status: {scrape_status} | {scrape_notes}")
 
@@ -964,7 +1187,7 @@ def run_combined_enrichment(
                 )
 
                 supabase.table("company_models").upsert(
-                    strip_internal_fields(model_row),
+                    sanitize_supabase_row("company_models", model_row),
                     on_conflict="company_register_id,model_provider",
                 ).execute()
 
@@ -1000,21 +1223,20 @@ def run_combined_enrichment(
         "models_csv": models_csv,
     }
 
+
 def fetch_handelsregister_data(query, api_key, log_callback=None):
     try:
-        # UPDATED: Use the new official endpoint
         url = "https://handelsregister.ai/api/v1/fetch-organization"
-        
+
         headers = {
             "x-api-key": str(api_key).strip(),
             "accept": "application/json",
         }
 
-        # UPDATED: Parameter changed to 'q', and we explicitly request the VIP data
         params = [
             ("q", query),
             ("feature", "shareholders"),
-            ("feature", "news")
+            ("feature", "news"),
         ]
 
         for attempt in range(1, MAX_RETRIES_PER_COMPANY + 1):
@@ -1065,4 +1287,5 @@ def fetch_handelsregister_data(query, api_key, log_callback=None):
     except Exception as e:
         if log_callback:
             log_callback(f"Fatal error in fetch_handelsregister_data: {e}")
+
         return "FATAL_ERROR", {}, "fatal_exception", str(e)
