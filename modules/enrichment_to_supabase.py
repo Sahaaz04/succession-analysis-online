@@ -293,15 +293,53 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
 def build_shareholder_rows_from_response(data, batch_id, register_id, company_name, api_status="OK", notes=""):
     rows = []
     shareholders = data.get("shareholders") or []
+
+    # 1. Handle if the API returned a wrapped dictionary instead of a raw list
     if isinstance(shareholders, dict):
+        if "data" in shareholders:
+            shareholders = shareholders["data"]
+        elif "items" in shareholders:
+            shareholders = shareholders["items"]
+        else:
+            # Handle case where API returns {"John Doe": {details}, "Jane Smith": {details}}
+            parsed_list = []
+            for key, val in shareholders.items():
+                if isinstance(val, dict):
+                    val["name"] = val.get("name", key)
+                    parsed_list.append(val)
+                else:
+                    parsed_list.append({"name": key, "value": val})
+            shareholders = parsed_list
+
+    # Ensure we are iterating over a list
+    if not isinstance(shareholders, list):
         shareholders = [shareholders]
 
     for item in shareholders:
+        # 2. Handle if the API just returns a list of name strings: ["John Doe", "Jane Doe"]
+        if isinstance(item, str):
+            item = {"name": item}
+
         if not isinstance(item, dict):
             continue
 
-        name = safe(item.get("shareholder_name") or item.get("name"))
+        # 3. Broaden the search keys (APIs frequently update their naming conventions)
+        name = safe(
+            item.get("shareholder_name") or 
+            item.get("name") or 
+            item.get("full_name") or 
+            item.get("fullName") or 
+            item.get("entity_name") or 
+            item.get("company_name")
+        )
+
+        # Fallback for split first/last names
+        if not name and (item.get("first_name") or item.get("last_name")):
+            name = safe(f"{item.get('first_name', '')} {item.get('last_name', '')}").strip()
+
         if not name:
+            # If it still fails, print to console so you can see the raw payload
+            print(f"DEBUG: Skipping shareholder row - no valid name key found in payload: {item}")
             continue
 
         rows.append({
