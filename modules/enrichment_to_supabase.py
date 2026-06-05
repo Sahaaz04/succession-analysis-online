@@ -449,7 +449,7 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
 def build_shareholder_rows(company, data, api_status, notes):
     register_id = clean_id(company.get("register_id", ""))
     company_name = clean_text(company.get("name", ""))
-    source_row = company.get("_source_row", "")
+    source_row = company.get("source_row", "")
 
     matched_entity_id = safe(data.get("entity_id"))
     matched_name = safe(data.get("name"))
@@ -607,7 +607,7 @@ def build_shareholder_rows(company, data, api_status, notes):
             "retrieved_at": now_iso(),
             "raw_data": entry,
             "dedupe_key": dedupe_key,
-            "_source_row": source_row,
+            "source_row": source_row,
         })
 
     return rows
