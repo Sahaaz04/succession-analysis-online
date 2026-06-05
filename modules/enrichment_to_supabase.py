@@ -1,16 +1,14 @@
-import csv 
+import csv
 import io
 import json
 import re
 import time
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
-
 import pandas as pd
-import requests
+from curl_cffi import requests  # Swapped standard requests for curl_cffi
 from anthropic import Anthropic
 from bs4 import BeautifulSoup
-
 
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_RETRIES_PER_COMPANY = 3
@@ -22,34 +20,27 @@ MAX_MODEL_SUMMARY_CHARS = 6000
 MAX_NEWS_ROWS = 10
 MAX_SHAREHOLDER_ROWS = 20
 
-
 def now_iso():
     return datetime.utcnow().isoformat()
-
 
 def safe(value):
     if value is None:
         return ""
     return str(value).strip()
 
-
 def clean_text(value):
     return re.sub(r"\s+", " ", safe(value)).strip()
-
 
 def clean_id(value):
     return clean_text(value).upper()
 
-
 def strip_internal_fields(row):
     if not isinstance(row, dict):
         return row
-
     internal_keys = {
         "id",
     }
     return {k: v for k, v in row.items() if k not in internal_keys}
-
 
 def log_to_supabase(supabase, batch_id, register_id, module, status, message):
     try:
@@ -63,7 +54,6 @@ def log_to_supabase(supabase, batch_id, register_id, module, status, message):
     except Exception:
         pass
 
-
 def table_has_row(supabase, table_name, filters):
     query = supabase.table(table_name).select("id")
     for col, value in filters.items():
@@ -71,14 +61,12 @@ def table_has_row(supabase, table_name, filters):
     result = query.limit(1).execute()
     return bool(result.data)
 
-
 def delete_existing_company_rows(supabase, batch_id, register_id):
     def delete_from(table_name):
         query = supabase.table(table_name).delete().eq("company_register_id", register_id)
         if batch_id is not None:
             query = query.eq("batch_id", batch_id)
         query.execute()
-
     try:
         delete_from("shareholders")
     except Exception:
@@ -89,7 +77,6 @@ def delete_existing_company_rows(supabase, batch_id, register_id):
     except Exception:
         pass
 
-    # FIX: company_models has no batch_id column — delete by register_id only
     try:
         supabase.table("company_models") \
             .delete() \
@@ -103,34 +90,29 @@ def delete_existing_company_rows(supabase, batch_id, register_id):
     except Exception:
         pass
 
-
 def delete_existing_enrichment_rows(supabase, batch_id, register_id):
     delete_existing_company_rows(supabase, batch_id, register_id)
 
-
 def fetch_html(url):
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; SuccessionAnalysisBot/1.0)"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
-    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    # UPDATED: Impersonating Chrome's TLS fingerprint to bypass Cloudflare
+    response = requests.get(url, headers=headers, impersonate="chrome", timeout=REQUEST_TIMEOUT_SECONDS)
     response.raise_for_status()
     return response.text
 
-
 def extract_text_from_html(html):
     soup = BeautifulSoup(html, "html.parser")
-
     for tag in soup(["script", "style", "noscript", "svg", "header", "footer"]):
         tag.decompose()
 
     text = soup.get_text(" ", strip=True)
     return clean_text(text)
 
-
 def find_internal_links(base_url, html, max_links=MAX_EXTRA_PAGES):
     soup = BeautifulSoup(html, "html.parser")
     base_domain = urlparse(base_url).netloc.lower()
-
     links = []
     seen = set()
 
@@ -163,12 +145,10 @@ def find_internal_links(base_url, html, max_links=MAX_EXTRA_PAGES):
 
     return links
 
-
 def scrape_website(url, log_callback=None):
     try:
         homepage_html = fetch_html(url)
         homepage_text = extract_text_from_html(homepage_html)
-
         all_text_parts = [homepage_text]
 
         internal_links = find_internal_links(url, homepage_html, max_links=MAX_EXTRA_PAGES)
@@ -194,38 +174,31 @@ def scrape_website(url, log_callback=None):
     except Exception as e:
         return "", "SCRAPE_ERROR", str(e)
 
-
 def build_claude_prompt(company_name, url, website_text):
     return f"""
 You are a business analyst and classification assistant.
-
 Analyze the website text below and return ONLY valid JSON with exactly these keys:
 {{
-  "detailed_business_model": "50-100 word concise business summary",
-  "business_segment": "short standardized segment like 'Food products - meat' or 'Industrial manufacturing - machinery'"
+"detailed_business_model": "50-100 word concise business summary",
+"business_segment": "short standardized segment like 'Food products - meat' or 'Industrial manufacturing - machinery'"
 }}
-
 Rules:
-- Use only information supported by the website text.
-- Do not invent facts.
-- The business_segment should be a short normalized label, not a sentence.
-- Keep it broad enough for filtering, but specific enough to be useful.
-- Return valid JSON only. No markdown. No explanation.
 
+Use only information supported by the website text.
+Do not invent facts.
+The business_segment should be a short normalized label, not a sentence.
+Keep it broad enough for filtering, but specific enough to be useful.
+Return valid JSON only. No markdown. No explanation.
 Company name:
 {company_name}
-
 Website:
 {url}
-
 Website text:
 {website_text}
 """.strip()
 
-
 def parse_claude_model_response(response_text):
     text = safe(response_text).strip()
-
     if not text:
         return "", "", "CLAUDE_ERROR", "Empty response."
 
@@ -271,11 +244,9 @@ def parse_claude_model_response(response_text):
 
     return detailed_business_model, business_segment, "OK", ""
 
-
 def summarize_with_claude(api_key, model_name, company_name, url, website_text, log_callback=None):
     if not url:
         return "", "", "NO_WEBSITE", "No website provided."
-
     if not website_text:
         return "", "", "NO_TEXT", "No website text extracted."
 
@@ -318,11 +289,9 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
             log_callback(f"Claude error: {e}")
         return "", "", "CLAUDE_ERROR", str(e)
 
-
 def build_shareholder_rows_from_response(data, batch_id, register_id, company_name, api_status="OK", notes=""):
     rows = []
     shareholders = data.get("shareholders") or []
-
     if isinstance(shareholders, dict):
         shareholders = [shareholders]
 
@@ -363,11 +332,9 @@ def build_shareholder_rows_from_response(data, batch_id, register_id, company_na
 
     return rows
 
-
 def build_news_rows_from_response(data, batch_id, register_id, company_name, api_status="OK", notes=""):
     rows = []
     news_items = data.get("news") or []
-
     if isinstance(news_items, dict):
         news_items = [news_items]
 
@@ -402,8 +369,6 @@ def build_news_rows_from_response(data, batch_id, register_id, company_name, api
 
     return rows
 
-
-# FIX: removed "batch_id": None — company_models table has no batch_id column
 def build_model_row(
     company_name,
     register_id,
@@ -415,7 +380,6 @@ def build_model_row(
     notes=""
 ):
     timestamp = now_iso()
-
     return {
         "company_register_id": register_id,
         "company_name": company_name,
@@ -437,24 +401,21 @@ def build_model_row(
         },
     }
 
-
 def upsert_rows(supabase, table_name, rows, conflict=None):
     if not rows:
         return 0
-
     query = supabase.table(table_name).upsert(rows)
     if conflict:
         query = query.on_conflict(conflict)
     query.execute()
     return len(rows)
 
-
 def save_companies_to_master(supabase, company_rows, update_existing_companies=True, log_callback=None):
     inserted = 0
     updated = 0
     skipped = 0
     companies_for_enrichment = []
-
+    
     for row in company_rows:
         register_id = clean_id(row.get("register_id"))
         company_name = safe(row.get("company_name") or row.get("name"))
@@ -545,7 +506,6 @@ def save_companies_to_master(supabase, company_rows, update_existing_companies=T
         "companies_for_enrichment": companies_for_enrichment,
     }
 
-
 def run_combined_enrichment(
     supabase,
     companies,
@@ -562,7 +522,6 @@ def run_combined_enrichment(
     shareholder_rows_saved = 0
     news_rows_saved = 0
     model_rows_saved = 0
-
     all_shareholder_rows = []
     all_news_rows = []
     all_model_rows = []
@@ -722,16 +681,9 @@ def run_combined_enrichment(
         "models_csv": models_csv,
     }
 
-
 def fetch_handelsregister_data(query, api_key, log_callback=None):
-    """
-    Keep this aligned with the Handelsregister.ai endpoint you already have working.
-    If your current version differs, paste your existing fetch function here and keep the
-    rest of this module as-is.
-    """
     try:
-        url = "https://api.handelsregister.ai/v1/search"
-
+        url = "[https://api.handelsregister.ai/v1/search](https://api.handelsregister.ai/v1/search)"
         headers = {
             "x-api-key": str(api_key).strip(),
             "accept": "application/json",
@@ -743,10 +695,12 @@ def fetch_handelsregister_data(query, api_key, log_callback=None):
 
         for attempt in range(1, MAX_RETRIES_PER_COMPANY + 1):
             try:
+                # UPDATED: Added impersonate="chrome" here as well
                 response = requests.get(
                     url,
                     headers=headers,
                     params=params,
+                    impersonate="chrome",
                     timeout=REQUEST_TIMEOUT_SECONDS,
                 )
 
@@ -765,6 +719,7 @@ def fetch_handelsregister_data(query, api_key, log_callback=None):
 
                 return response.status_code, {}, f"combined_failed_attempt_{attempt}", error_text
 
+            # Standard requests exceptions continue to work seamlessly under curl_cffi
             except requests.exceptions.Timeout:
                 error_text = f"Python request timeout after {REQUEST_TIMEOUT_SECONDS} seconds"
 
@@ -786,4 +741,6 @@ def fetch_handelsregister_data(query, api_key, log_callback=None):
         return "ERROR", {}, "failed_after_retries", "Failed after retries"
 
     except Exception as e:
-        return "ERROR", {}, "fetch_exception", str(e)
+        if log_callback:
+            log_callback(f"Fatal error in fetch_handelsregister_data: {e}")
+        return "FATAL_ERROR", {}, "fatal_exception", str(e)
