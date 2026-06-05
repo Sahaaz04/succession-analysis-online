@@ -290,98 +290,168 @@ def summarize_with_claude(api_key, model_name, company_name, url, website_text, 
             log_callback(f"Claude error: {e}")
         return "", "", "CLAUDE_ERROR", str(e)
 
-def build_shareholder_rows_from_response(data, batch_id, register_id, company_name, api_status="OK", notes=""):
+def build_shareholder_rows(company, data, api_status, notes):
+    register_id = clean_id(company.get("register_id", ""))
+    company_name = clean_text(company.get("name", ""))
+    source_row = company.get("_source_row", "")
+
+    matched_entity_id = safe(data.get("entity_id"))
+    matched_name = safe(data.get("name"))
+    matched_status = safe(data.get("status"))
+    legal_form = safe(data.get("legal_form"))
+
+    registration = data.get("registration", {}) or {}
+    court = safe(registration.get("court"))
+    register_type = safe(registration.get("register_type"))
+    register_number = safe(registration.get("register_number"))
+
+    input_register_number = extract_register_number(register_id)
+    register_match = "Yes" if input_register_number and str(register_number) == input_register_number else "Review"
+
+    # --- THE FIX: Correctly unwrap the API's nested dictionary to get the actual list ---
+    shareholders_data = data.get("shareholders") or []
+    if isinstance(shareholders_data, dict):
+        entries = (
+            shareholders_data.get("entries")
+            or shareholders_data.get("data")
+            or shareholders_data.get("items")
+            or []
+        )
+    else:
+        entries = shareholders_data
+
+    # Fallback to ensure we are iterating over a list
+    if not isinstance(entries, list):
+         entries = [entries] if entries else []
+    # ------------------------------------------------------------------------------------
+
     rows = []
-    shareholders = data.get("shareholders") or []
 
-    # 1. Unpack the "entries" array if it's wrapped in a dictionary
-    if isinstance(shareholders, dict):
-        if "entries" in shareholders:
-            shareholders = shareholders.get("entries", [])
-        elif "data" in shareholders:
-            shareholders = shareholders.get("data", [])
-        elif "items" in shareholders:
-            shareholders = shareholders.get("items", [])
-        else:
-            # Fallback
-            parsed_list = []
-            for key, val in shareholders.items():
-                if isinstance(val, list):
-                    parsed_list.extend(val)
-                elif isinstance(val, dict):
-                    parsed_list.append(val)
-            shareholders = parsed_list
+    if not entries:
+        return rows
 
-    # Ensure we are iterating over a list
-    if not isinstance(shareholders, list):
-        shareholders = [shareholders]
+    seen = set()
 
-    for item in shareholders:
-        if isinstance(item, str):
-            item = {"name": item}
-
-        if not isinstance(item, dict):
+    for entry in entries:
+        if not isinstance(entry, dict):
             continue
 
-        # 2. THE CRITICAL FIX: Extract the nested "shareholder" object
-        sh_obj = item.get("shareholder")
-        
-        # If 'shareholder' key doesn't exist, assume the data is flat
-        if sh_obj is None:
-            sh_obj = item
-        
-        # If 'shareholder' is just a string, wrap it in a dict
-        if isinstance(sh_obj, str):
-            sh_obj = {"name": sh_obj}
-
-        # 3. Extract the name from the inner object
-        name = safe(
-            sh_obj.get("name") or 
-            sh_obj.get("full_name") or 
-            sh_obj.get("company_name") or
-            item.get("shareholder_name") or 
-            item.get("name")
+        # --- RESTORED: Your robust parsing logic ---
+        shareholder = (
+            entry.get("shareholder")
+            or entry.get("person")
+            or entry.get("entity")
+            or entry.get("owner")
+            or entry
+            or {}
         )
 
-        # Fallback for split first/last names
-        if not name and (sh_obj.get("first_name") or sh_obj.get("last_name")):
-            name = safe(f"{sh_obj.get('first_name', '')} {sh_obj.get('last_name', '')}").strip()
+        contribution = (
+            entry.get("contribution")
+            or entry.get("share")
+            or {}
+        )
 
-        # If we STILL don't have a name, skip the row
-        if not name:
+        shareholder_name = get_shareholder_name(shareholder)
+
+        if not shareholder_name:
             continue
 
-        # 4. Map the fields (pulling from both the inner and outer objects)
-        contribution = safe(item.get("contribution") or item.get("contribution_amount") or sh_obj.get("contribution_amount"))
-        ratio = safe(item.get("contribution_ratio") or item.get("ownership_ratio") or sh_obj.get("ownership_ratio"))
-        address = safe(sh_obj.get("address") or sh_obj.get("shareholder_address") or item.get("address"))
-        dob = safe(sh_obj.get("dob") or sh_obj.get("birth_dob") or sh_obj.get("year_of_birth") or item.get("dob"))
-        
+        shareholder_type = classify_shareholder(shareholder)
+        birth_value = get_birth_value(shareholder)
+        age = calc_age(birth_value)
+
+        contribution_amount = ""
+        contribution_currency = ""
+
+        # This is what prevents that ugly JSON dictionary from showing up in your sheet!
+        if isinstance(contribution, dict):
+            contribution_amount = contribution.get("amount") or ""
+            contribution_currency = contribution.get("currency") or ""
+
+        contribution_amount = (
+            contribution_amount
+            or entry.get("contribution_amount")
+            or entry.get("amount")
+            or entry.get("capital_amount")
+            or ""
+        )
+
+        contribution_currency = (
+            contribution_currency
+            or entry.get("contribution_currency")
+            or entry.get("currency")
+            or entry.get("capital_currency")
+            or ""
+        )
+
+        ownership_ratio = (
+            entry.get("contribution_ratio")
+            or entry.get("ownership_ratio")
+            or entry.get("share_ratio")
+            or ""
+        )
+
+        ownership_percent = (
+            entry.get("ownership_percent")
+            or entry.get("ownership_percentage")
+            or entry.get("ownership_%")
+            or ""
+        )
+
+        if ownership_percent == "" and isinstance(ownership_ratio, (int, float)):
+            ownership_percent = round(ownership_ratio * 100, 2)
+
+        shareholder_address = ""
+        shareholder_country_code = ""
+        shareholder_registration_reference = ""
+
+        if isinstance(shareholder, dict):
+            shareholder_address = shareholder.get("address") or ""
+            shareholder_country_code = shareholder.get("country_code") or ""
+            shareholder_registration_reference = shareholder.get("registration_reference") or ""
+
+        dedupe_key = make_dedupe_key(
+            register_id,
+            shareholder_name,
+            contribution_amount,
+            ownership_percent,
+            ownership_ratio,
+        )
+
+        if dedupe_key in seen:
+            continue
+
+        seen.add(dedupe_key)
+
         rows.append({
-            "batch_id": batch_id,
             "company_register_id": register_id,
             "company_name": company_name,
-            "shareholder_name": name,
-            "shareholder_type": safe(sh_obj.get("type") or item.get("type")),
-            "birth_dob": dob,
-            "age": safe(sh_obj.get("age") or item.get("age")),
-            "shareholder_address": address,
-            "shareholder_country_code": safe(sh_obj.get("country_code") or item.get("country_code")),
-            "shareholder_registration_reference": safe(sh_obj.get("registration_reference") or item.get("registration_reference")),
-            "contribution_amount": contribution,
-            "contribution_currency": safe(item.get("currency") or item.get("contribution_currency")),
-            "ownership_ratio": ratio,
-            "ownership_percent": safe(item.get("ownership_percent") or sh_obj.get("ownership_percent")),
-            "matched_entity_id": safe(sh_obj.get("matched_entity_id") or item.get("matched_entity_id")),
-            "matched_company_name": safe(sh_obj.get("matched_company_name") or item.get("matched_company_name")),
-            "matched_status": safe(sh_obj.get("matched_status") or item.get("matched_status")),
-            "register_type": safe(sh_obj.get("register_type") or item.get("register_type")),
-            "register_number": safe(sh_obj.get("register_number") or item.get("register_number")),
-            "register_match": safe(sh_obj.get("register_match") or item.get("register_match")),
-            "api_status": api_status,
-            "notes": notes,
-            "raw_data": item,
+            "shareholder_name": shareholder_name,
+            "shareholder_type": shareholder_type,
+            "birth_dob": birth_value,
+            "age": str(age) if age is not None else "",
+            "shareholder_address": safe(shareholder_address),
+            "shareholder_country_code": safe(shareholder_country_code),
+            "shareholder_registration_reference": safe(shareholder_registration_reference),
+            "contribution_amount": safe(contribution_amount),
+            "contribution_currency": safe(contribution_currency),
+            "ownership_ratio": safe(ownership_ratio),
+            "ownership_percent": safe(ownership_percent),
+            "matched_entity_id": matched_entity_id,
+            "matched_company_name": matched_name,
+            "matched_status": matched_status,
+            "legal_form": legal_form,
+            "register_court": court,
+            "register_type": register_type,
+            "register_number": register_number,
+            "register_match": register_match,
+            "api_status": str(api_status),
+            "notes": notes or "",
             "retrieved_at": now_iso(),
+            "raw_data": entry,
+            "dedupe_key": dedupe_key,
+            "_source_row": source_row,
         })
 
     return rows
