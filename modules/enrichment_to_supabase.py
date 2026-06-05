@@ -568,6 +568,15 @@ def run_combined_enrichment(
         if replace_existing_enrichment:
             delete_existing_enrichment_rows(supabase, None, register_id)
 
+        # Per-company counters (reset each iteration so the completion log is accurate)
+        company_shareholder_count = 0
+        company_news_count = 0
+        company_model_saved = 0
+
+        hr_data = {}
+        hr_status = "SKIPPED"
+        hr_notes = ""
+
         hr_data = {}
         hr_status = "SKIPPED"
         hr_notes = ""
@@ -580,7 +589,36 @@ def run_combined_enrichment(
                     api_key=handelsregister_api_key,
                     log_callback=log_callback,
                 )
-                hr_status = api_status
+                # api_status is the HTTP status code (int 200) on success
+                hr_status = "OK" if api_status == 200 else str(api_status)
+
+                # --- FIX: Normalize nested API response structures ---
+                # The handelsregister API may wrap the payload under a "data"
+                # or "result" key. Unwrap one level so that build_*_from_response
+                # can always find "shareholders" and "news" at the top level.
+                if isinstance(hr_data, dict):
+                    if "shareholders" not in hr_data and "news" not in hr_data:
+                        for wrapper_key in ("data", "result", "company", "organization"):
+                            nested = hr_data.get(wrapper_key)
+                            if isinstance(nested, dict) and (
+                                "shareholders" in nested or "news" in nested
+                            ):
+                                if log_callback:
+                                    log_callback(
+                                        f"Unwrapping API response from key '{wrapper_key}'"
+                                    )
+                                hr_data = nested
+                                break
+
+                if log_callback:
+                    sh_count = len(hr_data.get("shareholders") or []) if isinstance(hr_data, dict) else 0
+                    news_count = len(hr_data.get("news") or []) if isinstance(hr_data, dict) else 0
+                    top_keys = list(hr_data.keys())[:10] if isinstance(hr_data, dict) else type(hr_data).__name__
+                    log_callback(
+                        f"Handelsregister raw response — status: {api_status} | "
+                        f"top-level keys: {top_keys} | "
+                        f"shareholders found: {sh_count} | news found: {news_count}"
+                    )
             except Exception as e:
                 hr_status = "ERROR"
                 hr_notes = str(e)
@@ -608,7 +646,8 @@ def run_combined_enrichment(
                 supabase.table("shareholders").insert(
                     [strip_internal_fields(r) for r in shareholder_rows]
                 ).execute()
-                shareholder_rows_saved += len(shareholder_rows)
+                company_shareholder_count = len(shareholder_rows)
+                shareholder_rows_saved += company_shareholder_count
                 all_shareholder_rows.extend(shareholder_rows)
                 shareholders_csv_rows.extend(shareholder_rows)
 
@@ -616,7 +655,8 @@ def run_combined_enrichment(
                 supabase.table("company_news").insert(
                     [strip_internal_fields(r) for r in news_rows]
                 ).execute()
-                news_rows_saved += len(news_rows)
+                company_news_count = len(news_rows)
+                news_rows_saved += company_news_count
                 all_news_rows.extend(news_rows)
                 news_csv_rows.extend(news_rows)
 
@@ -652,6 +692,7 @@ def run_combined_enrichment(
                 ).execute()
 
                 model_rows_saved += 1
+                company_model_saved = 1
                 all_model_rows.append(model_row)
                 model_csv_rows.append(model_row)
 
@@ -664,8 +705,8 @@ def run_combined_enrichment(
 
         if log_callback:
             log_callback(
-                f"Completed {company_name} | HR rows saved: {len(all_shareholder_rows)} | "
-                f"News rows saved: {len(all_news_rows)} | Model rows saved: {len(all_model_rows)}"
+                f"Completed {company_name} | HR rows saved: {company_shareholder_count} | "
+                f"News rows saved: {company_news_count} | Model rows saved: {company_model_saved}"
             )
 
     shareholders_csv = pd.DataFrame(shareholders_csv_rows).to_csv(index=False).encode("utf-8")
