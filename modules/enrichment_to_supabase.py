@@ -59,6 +59,146 @@ def strip_internal_fields(row):
     }
     return {k: v for k, v in row.items() if k not in internal_keys}
 
+def get_shareholder_name(shareholder):
+    """Return a clean shareholder name from the different shapes the API can return."""
+    if shareholder is None:
+        return ""
+
+    if isinstance(shareholder, str):
+        return clean_text(shareholder)
+
+    if not isinstance(shareholder, dict):
+        return clean_text(shareholder)
+
+    for key in (
+        "name",
+        "full_name",
+        "display_name",
+        "shareholder_name",
+        "person_name",
+        "company_name",
+        "legal_name",
+        "organization_name",
+        "firm",
+        "title",
+    ):
+        value = shareholder.get(key)
+        if value:
+            return clean_text(value)
+
+    first_name = shareholder.get("first_name") or shareholder.get("firstname") or shareholder.get("given_name")
+    last_name = shareholder.get("last_name") or shareholder.get("lastname") or shareholder.get("family_name") or shareholder.get("surname")
+    combined_name = clean_text(f"{safe(first_name)} {safe(last_name)}")
+    if combined_name:
+        return combined_name
+
+    for nested_key in ("person", "entity", "owner", "shareholder", "organization", "company"):
+        nested = shareholder.get(nested_key)
+        nested_name = get_shareholder_name(nested)
+        if nested_name:
+            return nested_name
+
+    return ""
+
+
+def classify_shareholder(shareholder):
+    """Classify shareholder as Natural, Corporate, or Unknown."""
+    if isinstance(shareholder, str):
+        text = shareholder.lower()
+    elif isinstance(shareholder, dict):
+        explicit_type = safe(
+            shareholder.get("type")
+            or shareholder.get("entity_type")
+            or shareholder.get("shareholder_type")
+            or shareholder.get("legal_form")
+        ).lower()
+
+        text = " ".join([explicit_type, get_shareholder_name(shareholder).lower()])
+
+        if any(k in explicit_type for k in ("person", "natural", "individual")):
+            return "Natural"
+        if any(k in explicit_type for k in ("company", "corporate", "legal", "organization", "entity")):
+            return "Corporate"
+    else:
+        return "Unknown"
+
+    corporate_markers = (
+        "gmbh", "ug", "ag", "kg", "ohg", "se", "ltd", "limited", "holding",
+        "s.a.", "sarl", "bv", "nv", "inc", "corp", "llc", "foundation", "stiftung"
+    )
+
+    if any(marker in text for marker in corporate_markers):
+        return "Corporate"
+
+    return "Natural" if text else "Unknown"
+
+
+def get_birth_value(shareholder):
+    """Extract birth date/year if present; otherwise return blank."""
+    if not isinstance(shareholder, dict):
+        return ""
+
+    for key in (
+        "date_of_birth",
+        "birth_date",
+        "birthdate",
+        "dob",
+        "birth",
+        "born",
+        "year_of_birth",
+        "birth_year",
+    ):
+        value = shareholder.get(key)
+        if value:
+            return safe(value)
+
+    for nested_key in ("person", "shareholder", "owner"):
+        nested_value = get_birth_value(shareholder.get(nested_key))
+        if nested_value:
+            return nested_value
+
+    return ""
+
+
+def calc_age(birth_value):
+    """Calculate approximate age from YYYY-MM-DD, DD.MM.YYYY, or YYYY."""
+    text = safe(birth_value)
+    if not text:
+        return None
+
+    year = None
+    month = 1
+    day = 1
+
+    match = re.search(r"\b(19\d{2}|20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b", text)
+    if match:
+        year, month, day = map(int, match.groups())
+    else:
+        match = re.search(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](19\d{2}|20\d{2})\b", text)
+        if match:
+            day, month, year = map(int, match.groups())
+        else:
+            match = re.search(r"\b(19\d{2}|20\d{2})\b", text)
+            if match:
+                year = int(match.group(1))
+
+    if not year:
+        return None
+
+    today = datetime.utcnow().date()
+    age = today.year - year
+
+    if (today.month, today.day) < (month, day):
+        age -= 1
+
+    return age if 0 <= age <= 130 else None
+
+
+def make_dedupe_key(*parts):
+    """Stable key to avoid inserting duplicate shareholder rows from the same API response."""
+    cleaned_parts = [clean_text(part).lower() for part in parts if clean_text(part)]
+    return "|".join(cleaned_parts)
+
 def log_to_supabase(supabase, batch_id, register_id, module, status, message):
     try:
         supabase.table("processing_logs").insert({
