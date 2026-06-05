@@ -756,10 +756,6 @@ def fetch_handelsregister_data(query, api_key, log_callback=None):
         headers = {
             "x-api-key": str(api_key).strip(),
             "accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
         }
 
         params = {
