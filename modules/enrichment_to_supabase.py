@@ -1263,7 +1263,9 @@ def run_combined_enrichment(
 
         if run_handelsregister:
             try:
-                query = company_name
+                city = safe(company.get("city"))
+                
+                query = f"{company_name} {city}".strip() if city else company_name
 
                 api_status, hr_data, _, hr_notes = fetch_handelsregister_data(
                     query=query,
