@@ -21,6 +21,7 @@ MAX_TEXT_PAGES = 3
 MAX_MODEL_SUMMARY_CHARS = 6000
 MAX_NEWS_ROWS = 10
 MAX_SHAREHOLDER_ROWS = 20
+MAX_CLAUDE_SHAREHOLDER_JSON_CHARS = 30000
 
 
 def now_iso():
@@ -176,14 +177,13 @@ def first_value_by_keys(obj, keys, max_depth=5):
 
 def extract_shareholder_entries(data):
     """
-    Handelsregister.ai shareholder objects may appear as:
+    Normalize shareholder structures from Handelsregister.ai into a list.
+
+    Handles structures like:
     - shareholders: [ ... ]
     - shareholders: {"entries": [ ... ]}
     - shareholders: {"items": [ ... ]}
     - shareholders: {"data": [ ... ]}
-    - ownership/shareholders nested under another object
-
-    This function normalizes those into a list.
     """
     if not isinstance(data, dict):
         return []
@@ -256,13 +256,6 @@ def get_shareholder_candidate(entry):
 
 
 def get_shareholder_name(shareholder):
-    """
-    Stronger parser:
-    - Checks common direct name fields.
-    - Checks German-ish / API-ish fields.
-    - Checks nested person/company/entity blocks.
-    - Falls back to combining first/last name.
-    """
     if shareholder is None:
         return ""
 
@@ -541,6 +534,244 @@ def extract_ownership_values(entry):
         ownership_percent = round(float(ownership_ratio) * 100, 2)
 
     return ownership_ratio, ownership_percent
+
+
+def parse_json_from_text(text):
+    text = safe(text).strip()
+
+    if not text:
+        raise ValueError("Empty JSON text.")
+
+    if text.startswith("```"):
+        text = text.replace("```json", "").replace("```", "").strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start >= 0 and end >= 0:
+        text = text[start:end + 1]
+
+    return json.loads(text)
+
+
+def build_claude_shareholder_prompt(company, hr_data, raw_shareholder_entries):
+    register_id = clean_id(company.get("register_id", ""))
+    company_name = clean_text(company.get("name", ""))
+
+    registration = hr_data.get("registration", {}) if isinstance(hr_data, dict) else {}
+    matched_payload = {
+        "input_company_name": company_name,
+        "input_register_id": register_id,
+        "matched_company_name": safe(hr_data.get("name")) if isinstance(hr_data, dict) else "",
+        "matched_entity_id": safe(hr_data.get("entity_id")) if isinstance(hr_data, dict) else "",
+        "matched_legal_form": safe(hr_data.get("legal_form")) if isinstance(hr_data, dict) else "",
+        "matched_status": safe(hr_data.get("status")) if isinstance(hr_data, dict) else "",
+        "matched_registration": registration,
+    }
+
+    raw_json = json.dumps(raw_shareholder_entries, ensure_ascii=False, default=str)
+
+    if len(raw_json) > MAX_CLAUDE_SHAREHOLDER_JSON_CHARS:
+        raw_json = raw_json[:MAX_CLAUDE_SHAREHOLDER_JSON_CHARS]
+
+    return f"""
+You are a strict JSON transformation engine.
+
+Task:
+Extract shareholder rows from the provided raw Handelsregister shareholder JSON.
+
+Rules:
+- Use ONLY the provided JSON.
+- Do NOT invent shareholder names, ownership percentages, contribution amounts, addresses, birth dates, or ages.
+- If a field is missing, return "" or null.
+- Return only current-looking shareholder entries from the provided shareholder JSON.
+- Do not output markdown.
+- Do not explain.
+- Return valid JSON only.
+
+Required output schema:
+{{
+  "shareholders": [
+    {{
+      "shareholder_name": "",
+      "shareholder_type": "Natural/Corporate/Unknown",
+      "birth_dob": "",
+      "age": null,
+      "shareholder_address": "",
+      "shareholder_country_code": "",
+      "shareholder_registration_reference": "",
+      "contribution_amount": "",
+      "contribution_currency": "",
+      "ownership_ratio": "",
+      "ownership_percent": "",
+      "notes": ""
+    }}
+  ]
+}}
+
+Classification guidance:
+- Corporate if the shareholder is a company/entity such as GmbH, UG, AG, KG, OHG, SE, Holding, Stiftung, Ltd, Inc, LLC, etc.
+- Natural if the shareholder is a human person.
+- Unknown if unclear.
+
+Company / matched entity context:
+{json.dumps(matched_payload, ensure_ascii=False, indent=2, default=str)}
+
+Raw shareholder JSON:
+{raw_json}
+""".strip()
+
+
+def parse_shareholders_with_claude(
+    api_key,
+    model_name,
+    company,
+    hr_data,
+    raw_shareholder_entries,
+    log_callback=None,
+):
+    if not api_key:
+        return [], "CLAUDE_FALLBACK_SKIPPED", "Claude API key missing."
+
+    if not raw_shareholder_entries:
+        return [], "CLAUDE_FALLBACK_SKIPPED", "No raw shareholder entries."
+
+    client = Anthropic(api_key=str(api_key).strip())
+    prompt = build_claude_shareholder_prompt(
+        company=company,
+        hr_data=hr_data,
+        raw_shareholder_entries=raw_shareholder_entries,
+    )
+
+    try:
+        request_payload = {
+            "model": model_name,
+            "max_tokens": 1200,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+        }
+
+        if "opus-4-7" not in str(model_name).lower():
+            request_payload["temperature"] = 0
+
+        response = client.messages.create(**request_payload)
+
+        text_parts = []
+        for block in response.content:
+            if getattr(block, "type", "") == "text":
+                text_parts.append(block.text)
+
+        response_text = "\n".join(text_parts).strip()
+
+        if not response_text:
+            return [], "CLAUDE_FALLBACK_ERROR", "Empty Claude shareholder response."
+
+        parsed = parse_json_from_text(response_text)
+        shareholders = parsed.get("shareholders", [])
+
+        if not isinstance(shareholders, list):
+            return [], "CLAUDE_FALLBACK_ERROR", "Claude returned shareholders but it was not a list."
+
+        cleaned = []
+        for item in shareholders:
+            if not isinstance(item, dict):
+                continue
+
+            name = clean_text(item.get("shareholder_name"))
+            if not name:
+                continue
+
+            cleaned.append(item)
+
+        return cleaned, "CLAUDE_FALLBACK_OK", ""
+
+    except Exception as e:
+        if log_callback:
+            log_callback(f"Claude shareholder fallback error: {e}")
+
+        return [], "CLAUDE_FALLBACK_ERROR", str(e)
+
+
+def build_shareholder_rows_from_claude_items(company, data, claude_items, api_status, notes):
+    register_id = clean_id(company.get("register_id", ""))
+    company_name = clean_text(company.get("name", ""))
+    source_row = to_int_or_none(company.get("source_row"))
+
+    matched_entity_id = safe(data.get("entity_id"))
+    matched_name = safe(data.get("name"))
+    matched_status = safe(data.get("status"))
+    legal_form = safe(data.get("legal_form"))
+
+    registration = data.get("registration", {}) or {}
+    court = safe(registration.get("court"))
+    register_type = safe(registration.get("register_type"))
+    register_number = safe(registration.get("register_number"))
+
+    input_register_number = extract_register_number(register_id)
+    register_match = "Yes" if input_register_number and str(register_number) == input_register_number else "Review"
+
+    rows = []
+
+    for item in claude_items:
+        shareholder_name = clean_text(item.get("shareholder_name"))
+        if not shareholder_name:
+            continue
+
+        shareholder_type = safe(item.get("shareholder_type")) or "Unknown"
+        if shareholder_type not in {"Natural", "Corporate", "Unknown"}:
+            shareholder_type = "Unknown"
+
+        birth_value = safe(item.get("birth_dob"))
+        age = to_int_or_none(item.get("age"))
+        if age is None and birth_value:
+            age = calc_age(birth_value)
+
+        row_notes = safe(item.get("notes"))
+        combined_notes = "Parsed by Claude shareholder JSON fallback."
+        if notes:
+            combined_notes += f" Original notes: {safe(notes)}"
+        if row_notes:
+            combined_notes += f" Claude notes: {row_notes}"
+
+        rows.append(
+            {
+                "company_register_id": register_id,
+                "company_name": company_name,
+                "shareholder_name": shareholder_name,
+                "shareholder_type": shareholder_type,
+                "birth_dob": birth_value,
+                "age": to_int_or_none(age),
+                "shareholder_address": safe(item.get("shareholder_address")),
+                "shareholder_country_code": safe(item.get("shareholder_country_code")),
+                "shareholder_registration_reference": safe(item.get("shareholder_registration_reference")),
+                "contribution_amount": safe(item.get("contribution_amount")),
+                "contribution_currency": safe(item.get("contribution_currency")),
+                "ownership_ratio": safe(item.get("ownership_ratio")),
+                "ownership_percent": safe(item.get("ownership_percent")),
+                "matched_entity_id": matched_entity_id,
+                "matched_company_name": matched_name,
+                "matched_status": matched_status,
+                "legal_form": legal_form,
+                "register_court": court,
+                "register_type": register_type,
+                "register_number": register_number,
+                "register_match": register_match,
+                "api_status": str(api_status),
+                "notes": combined_notes[:1000],
+                "retrieved_at": now_iso(),
+                "raw_data": {
+                    "source": "claude_shareholder_fallback",
+                    "claude_item": item,
+                },
+                "source_row": to_int_or_none(source_row),
+            }
+        )
+
+    return rows
 
 
 def log_to_supabase(supabase, batch_id, register_id, module, status, message):
@@ -861,10 +1092,8 @@ def build_shareholder_rows(company, data, api_status, notes, log_callback=None):
     if not entries:
         return rows
 
-    seen = set()
     skipped_no_name = 0
     skipped_non_dict = 0
-    skipped_duplicate = 0
 
     for entry_index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
@@ -923,20 +1152,6 @@ def build_shareholder_rows(company, data, api_status, notes, log_callback=None):
                 or ""
             )
 
-        dedupe_key = make_dedupe_key(
-            register_id,
-            shareholder_name,
-            contribution_amount,
-            ownership_percent,
-            ownership_ratio,
-        )
-
-        if dedupe_key in seen:
-            skipped_duplicate += 1
-            continue
-
-        seen.add(dedupe_key)
-
         rows.append(
             {
                 "company_register_id": register_id,
@@ -964,16 +1179,15 @@ def build_shareholder_rows(company, data, api_status, notes, log_callback=None):
                 "notes": notes or "",
                 "retrieved_at": now_iso(),
                 "raw_data": entry,
-                "dedupe_key": dedupe_key,
                 "source_row": to_int_or_none(source_row),
             }
         )
 
-    if log_callback and (skipped_no_name or skipped_non_dict or skipped_duplicate):
+    if log_callback and (skipped_no_name or skipped_non_dict):
         log_callback(
             f"[SH DEBUG] {company_name}: raw shareholder entries={len(entries)}, "
-            f"saved={len(rows)}, skipped_non_dict={skipped_non_dict}, "
-            f"skipped_no_name={skipped_no_name}, skipped_duplicate={skipped_duplicate}"
+            f"saved_by_code={len(rows)}, skipped_non_dict={skipped_non_dict}, "
+            f"skipped_no_name={skipped_no_name}"
         )
 
     return rows
@@ -1264,8 +1478,10 @@ def run_combined_enrichment(
         if run_handelsregister:
             try:
                 city = safe(company.get("city"))
-                
                 query = f"{company_name} {city}".strip() if city else company_name
+
+                if log_callback:
+                    log_callback(f"Trying Handelsregister query: {query}")
 
                 api_status, hr_data, _, hr_notes = fetch_handelsregister_data(
                     query=query,
@@ -1321,6 +1537,8 @@ def run_combined_enrichment(
             company_for_rows = dict(company)
             company_for_rows["source_row"] = source_row
 
+            raw_shareholder_entries = extract_shareholder_entries(hr_data)
+
             shareholder_rows = build_shareholder_rows(
                 company=company_for_rows,
                 data=hr_data,
@@ -1328,6 +1546,43 @@ def run_combined_enrichment(
                 notes=hr_notes,
                 log_callback=log_callback,
             )
+
+            if raw_shareholder_entries and not shareholder_rows and claude_api_key:
+                if log_callback:
+                    log_callback(
+                        f"Trying Claude shareholder fallback: raw shareholder entries found={len(raw_shareholder_entries)}, "
+                        f"code parsed rows=0"
+                    )
+
+                claude_items, claude_parse_status, claude_parse_notes = parse_shareholders_with_claude(
+                    api_key=claude_api_key,
+                    model_name=claude_model_name,
+                    company=company_for_rows,
+                    hr_data=hr_data,
+                    raw_shareholder_entries=raw_shareholder_entries,
+                    log_callback=log_callback,
+                )
+
+                if claude_items:
+                    shareholder_rows = build_shareholder_rows_from_claude_items(
+                        company=company_for_rows,
+                        data=hr_data,
+                        claude_items=claude_items,
+                        api_status=hr_status,
+                        notes=claude_parse_status,
+                    )
+
+                    if log_callback:
+                        log_callback(
+                            f"Claude shareholder fallback parsed rows: {len(shareholder_rows)} | "
+                            f"status: {claude_parse_status}"
+                        )
+                else:
+                    if log_callback:
+                        log_callback(
+                            f"Claude shareholder fallback returned 0 rows | "
+                            f"status: {claude_parse_status} | notes: {claude_parse_notes}"
+                        )
 
             news_rows = build_news_rows_from_response(
                 hr_data,
